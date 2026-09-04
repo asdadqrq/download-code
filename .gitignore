@@ -1,0 +1,12 @@
+__pycache__/
+.idea/
+.DS_Store
+node_modules
+test-baidu.py
+.env
+.env.*
+.chrome-115-profile/
+.chrome-bt4g-profile/
+*.csv
+*.html
+*.log
