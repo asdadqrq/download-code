@@ -2,6 +2,7 @@
 import argparse
 import base64
 import csv
+from concurrent.futures import ThreadPoolExecutor
 import html
 import json
 import os
@@ -23,6 +24,19 @@ GOOGLE_CSE_URL = "https://www.googleapis.com/customsearch/v1?key={key}&cx={cx}&q
 DDG_LITE_URL = "https://lite.duckduckgo.com/lite/?q={query}"
 BING_SEARCH_URL = "https://www.bing.com/search?q={query}"
 DEFAULT_CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+
+class GoogleChallengeError(RuntimeError):
+    """Google stopped serving results and requires user action in Chrome."""
+
+
+class GoogleTabRequiredError(RuntimeError):
+    """No existing Chrome Google results tab is available to reuse."""
+
+
+def is_google_host(host):
+    host = (host or "").lower()
+    return host == "google.com" or host.startswith("google.") or host.startswith("www.google.")
 
 
 def split_codes(values):
@@ -177,12 +191,18 @@ def field_confirms_code_uncensored(field, patterns, code):
         return False
 
     gap = r"(?:[\s\[\]\(\)\{\}:_\-–—|/\\.,]*|[\s\[\]\(\)\{\}:_\-–—|/\\.,]*(?:leak(?:ed)?|mosaic|version|vr)?[\s\[\]\(\)\{\}:_\-–—|/\\.,]*)"
-    keyword = r"(?:un[-\s_]?censored|de[-\s_]?censored|uncensor(?:ed)?|decensor(?:ed)?|uncen)"
+    keyword = r"(?<![A-Z0-9])(?:un[-\s_]?censored|de[-\s_]?censored|uncensor(?:ed)?|decensor(?:ed)?|uncen)(?![A-Z0-9])"
+    month = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+    date = rf"(?:{month}\.?\s+\d{{1,2}},?\s+\d{{4}}|\d{{4}}[-/.]\d{{1,2}}[-/.]\d{{1,2}})"
+    # Some detail snippets place a version suffix and release date before the label.
+    metadata_gap = rf"(?:[-_\s]+RM)?\s+release\s+date\s*:?\s*{date}\s*,?\s*"
     for pattern in patterns:
         code_pattern = pattern.pattern
         if re.search(code_pattern + gap + keyword, field, re.IGNORECASE):
             return True
         if re.search(keyword + gap + code_pattern, field, re.IGNORECASE):
+            return True
+        if re.search(code_pattern + metadata_gap + keyword + r"\s+(?:leaked\s+)?version\b", field, re.IGNORECASE):
             return True
     return False
 
@@ -297,6 +317,10 @@ def google_result_script(query, limit):
     return r"""(() => {
       const expected = %QUERY%;
       const current = new URL(location.href);
+      const text = document.body ? document.body.innerText : '';
+      const blocked = current.pathname.startsWith('/sorry/') ||
+        /our systems have detected unusual traffic|this page checks to see if it's really you|verify you are human|not a robot/i.test(text);
+      if (blocked) return {ready:false, blocked:true, results:[]};
       if (current.pathname !== '/search' || current.searchParams.get('q') !== expected)
         return {ready:false, results:[]};
       const root = document.querySelector('#rso') || document.querySelector('#search');
@@ -310,34 +334,87 @@ def google_result_script(query, limit):
         rows.push({title:heading.innerText.trim(), link:anchor.href,
           snippet:(block.innerText || '').replace(/\s+/g,' ').trim()});
       }
-      const text = document.body ? document.body.innerText : '';
-      const blocked = !rows.length && /unusual traffic|not a robot|verify you are human/i.test(text);
       const empty = /did not match any documents|no results found/i.test(text);
       return {ready:rows.length > 0 || empty, blocked, results:rows.slice(0,%LIMIT%)};
     })()""".replace('%QUERY%', json.dumps(query)).replace('%LIMIT%', str(int(limit)))
 
 
 class ExistingChromeGoogleSearcher:
-    """Search in the user's normal macOS Chrome profile without launching a new one."""
+    """Search an existing Google tab in the user's macOS Chrome profile."""
     method = "google_chrome"
 
-    def __init__(self, wait_seconds=4):
+    def __init__(self, wait_seconds=4, app=None, tab=None):
         self.timeout = max(15, wait_seconds + 10)
-        self.window_id = None
-        self.tab_id = None
+        self.app = app
+        self.tab = tab
 
     @staticmethod
-    def run(lines):
-        result = subprocess.run(
-            ['osascript', '-'], input='\n'.join(lines), text=True,
-            capture_output=True, timeout=30,
-        )
-        if result.returncode:
-            message = result.stderr.strip()
-            if 'Executing JavaScript through AppleScript is turned off' in message:
-                raise RuntimeError('Enable Chrome > View > Developer > Allow JavaScript from Apple Events.')
-            raise RuntimeError(message or 'Could not read normal Chrome')
-        return result.stdout.strip()
+    def select_tabs(queries, count):
+        try:
+            import objc
+            from AppKit import NSWorkspace
+        except ImportError as exc:
+            raise RuntimeError(
+                "Chrome profile selection requires PyObjC in this Python environment."
+            ) from exc
+
+        framework = "/System/Library/Frameworks/ScriptingBridge.framework"
+        bundle = {}
+        objc.loadBundle("ScriptingBridge", bundle, bundle_path=framework)
+        script_app = bundle["SBApplication"]
+        candidates = []
+        chrome_windows = []
+        for process in NSWorkspace.sharedWorkspace().runningApplications():
+            if process.bundleIdentifier() != "com.google.Chrome":
+                continue
+            app = script_app.applicationWithProcessIdentifier_(process.processIdentifier())
+            try:
+                for window in app.windows():
+                    chrome_windows.append((len(window.tabs()), app, window))
+                    active_id = window.activeTab().id()
+                    for tab in window.tabs():
+                        parsed = urlparse(tab.URL() or "")
+                        if not is_google_host(parsed.hostname):
+                            continue
+                        if parsed.path not in {"/", "/search"}:
+                            continue
+                        tab_query = parse_qs(parsed.query).get("q", [None])[0]
+                        if parsed.path == "/search" and tab_query in queries:
+                            priority = 0
+                        elif tab.id() == active_id and parsed.path == "/search":
+                            priority = 1
+                        elif tab.id() == active_id:
+                            priority = 2
+                        elif parsed.path == "/search":
+                            priority = 3
+                        else:
+                            priority = 4
+                        candidates.append((priority, app, window, tab))
+            except (AttributeError, RuntimeError):
+                continue
+        candidates.sort(key=lambda candidate: candidate[0])
+        if len(candidates) < count and (candidates or chrome_windows):
+            if candidates:
+                _, app, window, _ = candidates[0]
+            else:
+                _, app, window = max(chrome_windows, key=lambda item: item[0])
+            while len(candidates) < count:
+                new_tab = app.classForScriptingClass_("tab").alloc().initWithProperties_(
+                    {"URL": "https://www.google.com/"}
+                )
+                window.tabs().addObject_(new_tab)
+                added_tab = window.tabs()[-1]
+                candidates.append((5, app, window, added_tab))
+        if len(candidates) < count:
+            raise GoogleTabRequiredError(
+                "Open Google in Chrome, then rerun. The script will create "
+                "the additional worker page in that Chrome profile."
+            )
+        return [(app, tab) for _, app, _, tab in candidates[:count]]
+
+    @classmethod
+    def select_tab(cls, query):
+        return cls.select_tabs([query], 1)[0]
 
     def __enter__(self):
         return self
@@ -347,43 +424,28 @@ class ExistingChromeGoogleSearcher:
         return False
 
     def evaluate(self, script):
-        encoded = json.dumps('JSON.stringify(' + script + ')', ensure_ascii=False)
-        return json.loads(self.run([
-            'tell application "Google Chrome"',
-            f'set t to tab id {self.tab_id} of window id {self.window_id}',
-            f'return execute t javascript {encoded}',
-            'end tell',
-        ]))
+        result = self.tab.executeJavascript_("JSON.stringify(" + script + ")")
+        if not result:
+            raise RuntimeError(
+                "Chrome could not return page data. Enable View > Developer > "
+                "Allow JavaScript from Apple Events."
+            )
+        return json.loads(result)
 
     def search(self, query, limit=10):
         url = GOOGLE_BROWSER_URL.format(query=quote_plus(query), num=limit)
-        if self.tab_id is None:
-            # Reuse an exact query tab when possible; never overwrite unrelated tabs.
-            stem = 'https://www.google.com/search?q=' + quote_plus(query)
-            result = self.run([
-                'tell application "Google Chrome"',
-                'repeat with w in windows',
-                'repeat with t in tabs of w',
-                f'if URL of t is {json.dumps(stem)} or URL of t starts with {json.dumps(stem + "&")} then',
-                'return (id of w as text) & linefeed & (id of t as text)',
-                'end if', 'end repeat', 'end repeat',
-                'if (count of windows) = 0 then make new window',
-                'set w to front window',
-                f'set t to make new tab at end of tabs of w with properties {{URL:{json.dumps(url)}}}',
-                'return (id of w as text) & linefeed & (id of t as text)',
-                'end tell',
-            ])
-            self.window_id, self.tab_id = map(int, result.splitlines())
-        else:
-            self.run(['tell application "Google Chrome"',
-                      f'set URL of tab id {self.tab_id} of window id {self.window_id} to {json.dumps(url)}',
-                      'end tell'])
+        if self.tab is None:
+            self.app, self.tab = self.select_tab(query)
+        current_url = urlparse(self.tab.URL() or "")
+        if (current_url.path != "/search"
+                or parse_qs(current_url.query).get("q", [None])[0] != query):
+            self.tab.setURL_(url)
         deadline = time.monotonic() + self.timeout
         script = google_result_script(query, limit)
         while time.monotonic() < deadline:
             state = self.evaluate(script)
             if state.get('blocked'):
-                raise RuntimeError('Google requires verification in the Chrome search tab. Complete it and rerun.')
+                raise GoogleChallengeError('Google showed the unusual-traffic page. Stop the batch; complete verification in Chrome and rerun the unresolved codes.')
             if state.get('ready'):
                 return [dict(item, link=normalize_google_link(item['link']))
                         for item in state['results'] if is_search_result_url(normalize_google_link(item['link']))]
@@ -684,6 +746,27 @@ def check_codes(codes, limit=10, delay=2.0, browser_searcher=None):
                     "error": error,
                 }
             )
+        except GoogleTabRequiredError:
+            raise
+        except GoogleChallengeError as exc:
+            message = str(exc)
+            for remaining_code in codes[i - 1:]:
+                remaining_query = f"{remaining_code} uncensored"
+                rows.append({
+                    "code": remaining_code,
+                    "query": remaining_query,
+                    "matched": "unknown",
+                    "match_rank": "",
+                    "match_title": "",
+                    "match_url": "",
+                    "match_snippet": "",
+                    "result_count_checked": 0,
+                    "search_method": getattr(browser_searcher, 'method', 'google_chrome'),
+                    "google_url": GOOGLE_BROWSER_URL.format(query=quote_plus(remaining_query), num=limit),
+                    "error": message if remaining_code == code else "Not searched after Google stopped the batch.",
+                })
+            print(f"{i}/{len(codes)} {code}: unknown (Google stopped the batch)")
+            break
         except Exception as exc:
             rows.append(
                 {
@@ -706,6 +789,39 @@ def check_codes(codes, limit=10, delay=2.0, browser_searcher=None):
     return rows
 
 
+def check_codes_parallel(codes, searchers, limit=4, delay=4.0):
+    rows = []
+    workers = len(searchers)
+    for start in range(0, len(codes), workers):
+        batch = codes[start:start + workers]
+        with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+            futures = [
+                executor.submit(check_codes, [code], limit, 0, searchers[index])
+                for index, code in enumerate(batch)
+            ]
+            batch_rows = [future.result()[0] for future in futures]
+        rows.extend(batch_rows)
+        challenge = next(
+            (row["error"] for row in batch_rows if "unusual-traffic" in row["error"]),
+            None,
+        )
+        if challenge:
+            for code in codes[start + len(batch):]:
+                query = f"{code} uncensored"
+                rows.append({
+                    "code": code, "query": query, "matched": "unknown",
+                    "match_rank": "", "match_title": "", "match_url": "",
+                    "match_snippet": "", "result_count_checked": 0,
+                    "search_method": "google_chrome",
+                    "google_url": GOOGLE_BROWSER_URL.format(query=quote_plus(query), num=limit),
+                    "error": "Not searched after Google stopped the batch.",
+                })
+            break
+        if start + len(batch) < len(codes) and delay > 0:
+            time.sleep(delay)
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Search Google for "<code> uncensored" and mark whether results contain the code.'
@@ -713,8 +829,10 @@ def main():
     parser.add_argument("codes", nargs="*", help="Codes. Comma-separated input is accepted.")
     parser.add_argument("--codes-file", help="Text file containing codes, one per line or comma-separated")
     parser.add_argument("-o", "--output", default="google_uncensored_check.csv", help="Output CSV path")
-    parser.add_argument("--limit", type=int, default=10, help="Google results to check per code")
-    parser.add_argument("--delay", type=float, default=2.0, help="Seconds to wait between searches")
+    parser.add_argument("--limit", type=int, default=4, help="Google results to check per code")
+    parser.add_argument("--delay", type=float, default=4.0, help="Seconds to wait between search batches")
+    parser.add_argument("--workers", type=int, choices=[1, 2], default=2,
+                        help="Number of existing Google tabs used in parallel")
     parser.add_argument(
         "--browser",
         choices=["auto", "none", "chrome", "safari"],
@@ -737,8 +855,22 @@ def main():
         with SafariGoogleSearcher(wait_seconds=args.browser_wait) as searcher:
             rows = check_codes(codes, limit=args.limit, delay=args.delay, browser_searcher=searcher)
     elif sys.platform == 'darwin' and not args.chrome_path:
-        with ExistingChromeGoogleSearcher(wait_seconds=args.browser_wait) as searcher:
-            rows = check_codes(codes, limit=args.limit, delay=args.delay, browser_searcher=searcher)
+        try:
+            selected = ExistingChromeGoogleSearcher.select_tabs(
+                [f"{code} uncensored" for code in codes],
+                min(args.workers, len(codes)),
+            )
+            searchers = [
+                ExistingChromeGoogleSearcher(
+                    wait_seconds=args.browser_wait, app=app, tab=tab
+                )
+                for app, tab in selected
+            ]
+            rows = check_codes_parallel(
+                codes, searchers, limit=args.limit, delay=args.delay
+            )
+        except GoogleTabRequiredError as exc:
+            parser.exit(2, f"{exc}\n")
     else:
         try:
             with ChromeGoogleSearcher(chrome_path=args.chrome_path, wait_seconds=args.browser_wait) as searcher:

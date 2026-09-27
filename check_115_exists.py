@@ -13,6 +13,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from urllib.error import URLError
+from urllib.parse import urlparse
 from urllib.request import urlopen
 
 try:
@@ -190,6 +191,60 @@ def open_browser(profile_dir: Path) -> tuple[subprocess.Popen, CdpClient]:
     return process, client
 
 
+def select_115_tab(apps):
+    candidates = []
+    for app in apps:
+        try:
+            for window in app.windows():
+                active_id = window.activeTab().id()
+                for tab in window.tabs():
+                    parsed = urlparse(tab.URL() or "")
+                    if parsed.hostname not in {"115.com", "www.115.com"}:
+                        continue
+                    if parsed.path not in {"/", "/storage/allfiles"}:
+                        continue
+                    candidates.append((tab.id() != active_id, parsed.path != "/storage/allfiles", app, tab))
+        except (AttributeError, RuntimeError):
+            continue
+    if not candidates:
+        raise RuntimeError("Open your 115 file page in Chrome, then rerun the script.")
+    candidates.sort(key=lambda item: item[:2])
+    return candidates[0][2:]
+
+
+class ExistingChromeClient:
+    def __init__(self):
+        try:
+            import objc
+            from AppKit import NSWorkspace
+        except ImportError as exc:
+            raise RuntimeError("Your Python needs PyObjC to read existing Chrome tabs.") from exc
+
+        bundle = {}
+        objc.loadBundle(
+            "ScriptingBridge", bundle,
+            bundle_path="/System/Library/Frameworks/ScriptingBridge.framework",
+        )
+        applications = [
+            bundle["SBApplication"].applicationWithProcessIdentifier_(process.processIdentifier())
+            for process in NSWorkspace.sharedWorkspace().runningApplications()
+            if process.bundleIdentifier() == "com.google.Chrome"
+        ]
+        self.app, self.tab = select_115_tab(applications)
+
+    def evaluate(self, expression: str):
+        response = self.tab.executeJavascript_(f"JSON.stringify({expression})")
+        if not response:
+            raise RuntimeError(
+                "Chrome could not read the 115 page. Enable View > Developer > "
+                "Allow JavaScript from Apple Events."
+            )
+        return json.loads(response)
+
+    def close(self):
+        pass  # Keep the user's Chrome tab open.
+
+
 READY_SCRIPT = r"""
 (() => Boolean(
   location.hostname.endsWith('115.com') &&
@@ -244,6 +299,24 @@ def read_results(client: CdpClient, code: str, timeout: float = 12) -> dict:
   const input = [...document.querySelectorAll('input')].find(el =>
     (el.placeholder || '').includes('搜索')
   );
+  const frame = [...document.querySelectorAll('iframe')].find(el => {{
+    try {{
+      return new URL(el.src).searchParams.get('search_value') === {encoded};
+    }} catch {{ return false; }}
+  }});
+  if (frame) {{
+    const doc = frame.contentDocument;
+    const text = doc?.body?.innerText || '';
+    const counts = text.match(/当前共\s*(\d+)\s*个文件[，,]\s*(\d+)\s*个文件夹/);
+    const empty = /未找到|没有找到|暂无相关|无搜索结果/.test(text);
+    return {{
+      queryReady: Boolean(input && input.value === {encoded}),
+      settled: Boolean(counts || empty),
+      resultCount: counts ? Number(counts[1]) + Number(counts[2]) : 0,
+      names: [...(doc?.querySelectorAll('li[rel="item"][title]') || [])]
+        .map(el => el.getAttribute('title')).filter(Boolean)
+    }};
+  }}
   const bodyText = document.body.innerText || '';
   const found = bodyText.match(/找到\s+(\d+)\s+个结果/);
   const noResult = /未找到|没有找到|暂无相关|无搜索结果/.test(bodyText);
@@ -329,6 +402,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("codes", nargs="+", help="Codes separated by commas or spaces")
     parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--browser", choices=["existing", "dedicated"], default="existing",
+        help="Use your open Chrome 115 tab (default), or the separate persistent profile",
+    )
     parser.add_argument("--profile-dir", type=Path, default=DEFAULT_PROFILE)
     parser.add_argument(
         "--keep-browser", action="store_true", help="Leave the script-launched Chrome open"
@@ -343,13 +420,19 @@ def main() -> None:
     client = None
     rows: list[dict] = []
     try:
-        print("Opening Chrome with the persistent 115 profile...")
-        process, client = open_browser(args.profile_dir.expanduser().resolve())
-        if not wait_until_ready(client, 8):
-            print("Log in to 115.com in the opened Chrome window.")
-            input("After the file page is visible, press Enter here to continue... ")
-            if not wait_until_ready(client, 120):
-                raise RuntimeError("115.com file search did not become ready")
+        if args.browser == "existing":
+            print("Using your open 115 page in Chrome...")
+            client = ExistingChromeClient()
+            if not wait_until_ready(client, 8):
+                raise RuntimeError("The open 115 tab has no ready file-search field.")
+        else:
+            print("Opening Chrome with the persistent 115 profile...")
+            process, client = open_browser(args.profile_dir.expanduser().resolve())
+            if not wait_until_ready(client, 8):
+                print("Log in to 115.com in the opened Chrome window.")
+                input("After the file page is visible, press Enter here to continue... ")
+                if not wait_until_ready(client, 120):
+                    raise RuntimeError("115.com file search did not become ready")
 
         for index, code in enumerate(codes, start=1):
             print(f"[{index}/{len(codes)}] Checking {code}...")

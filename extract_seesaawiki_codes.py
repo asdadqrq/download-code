@@ -3,7 +3,6 @@ import argparse
 import csv
 import re
 import sys
-from bisect import bisect_right
 from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -13,10 +12,6 @@ from urllib.request import Request, urlopen
 from bs4 import BeautifulSoup, NavigableString, Tag, Comment
 
 
-ENTRY_RE = re.compile(
-    r"\b(\d{4}/\d{1,2}/\d{1,2})\s+(?:発売日変更\s*)?"
-    r"([A-Z0-9]+(?:-[A-Z0-9]+)+)(?![A-Z0-9-])", re.IGNORECASE
-)
 CODE_ONLY_RE = re.compile(r"[A-Z0-9]+(?:-[A-Z0-9]+)+", re.IGNORECASE)
 RELEASE_DATE_RE = re.compile(r"\b\d{4}/\d{1,2}/\d{1,2}\b")
 
@@ -42,24 +37,64 @@ def is_detail_link(href):
     return False
 
 
+def compact_dmm_code(value):
+    value = unquote(value or "").strip().lower()
+    value = re.sub(r"^h_?\d+(?=[a-z])", "", value)
+    value = re.sub(r"^\d+(?=[a-z])", "", value)
+    match = re.fullmatch(r"([a-z][a-z0-9]*?)(\d+)([a-z]?)", value)
+    if not match:
+        return ""
+    prefix, number, suffix = match.groups()
+    normalized_number = str(int(number)).zfill(3)
+    return f"{prefix.upper()}-{normalized_number}{suffix.upper()}"
+
+
+def code_from_detail_url(href):
+    parsed = urlsplit(href or "")
+    host = (parsed.hostname or "").lower()
+    if host == "dmm.co.jp" or host.endswith(".dmm.co.jp"):
+        product_id = parse_qs(parsed.query).get("id", [""])[0]
+        if not product_id:
+            match = re.search(r"/cid=([^/]+)/?", parsed.path, re.IGNORECASE)
+            product_id = match.group(1) if match else ""
+        return compact_dmm_code(product_id)
+    if host == "mgstage.com" or host.endswith(".mgstage.com"):
+        match = re.search(r"/product/product_detail/([^/]+)/?", parsed.path, re.IGNORECASE)
+        candidate = unquote(match.group(1)) if match else ""
+        return candidate.upper() if CODE_ONLY_RE.fullmatch(candidate) and re.search(r"\d", candidate) else ""
+    if host == "prestige-av.com" or host.endswith(".prestige-av.com"):
+        candidate = parse_qs(parsed.query).get("sku", [""])[0]
+        return candidate.upper() if CODE_ONLY_RE.fullmatch(candidate) and re.search(r"\d", candidate) else ""
+    if host == "adult.contents.fc2.com":
+        match = re.fullmatch(r"/article/(\d+)/?", parsed.path)
+        return f"FC2-PPV-{match.group(1)}" if match else ""
+    return ""
+
+
 def release_entries(area):
-    # Match across inline markup, then map the code back to its last DOM text node.
-    nodes = [node for node in area.find_all(string=True)
-             if not isinstance(node, Comment)
-             and not node.find_parent(["script", "style"])]
-    starts, parts, position = [], [], 0
-    for node in nodes:
-        starts.append(position)
-        parts.append(str(node))
-        position += len(str(node)) + 1
-    for match in ENTRY_RE.finditer(" ".join(parts)):
-        date, code = match.groups()
-        try:
-            date = datetime.strptime(date, "%Y/%m/%d").strftime("%Y/%m/%d")
-        except ValueError:
+    """Yield every dated block, including entries whose code is absent."""
+    for node in area.find_all(string=RELEASE_DATE_RE):
+        if isinstance(node, Comment) or node.find_parent(["script", "style"]):
             continue
-        node = nodes[bisect_right(starts, match.end(2) - 1) - 1]
-        yield node, date, code.upper()
+        for date_match in RELEASE_DATE_RE.finditer(str(node)):
+            date = date_match.group()
+            header_parts = [str(node)[date_match.end():]]
+            last_text_node = node
+            for following in node.next_elements:
+                if isinstance(following, Tag) and following.name in {"br", "a"}:
+                    break
+                if isinstance(following, NavigableString):
+                    if RELEASE_DATE_RE.search(str(following)):
+                        break
+                    header_parts.append(str(following))
+                    last_text_node = following
+            code_match = CODE_ONLY_RE.search(clean_text(" ".join(header_parts)))
+            code = code_match.group().upper() if code_match else ""
+            try:
+                date = datetime.strptime(date, "%Y/%m/%d").strftime("%Y/%m/%d")
+            except ValueError:
+                continue
+            yield last_text_node if code else node, date, code
 
 
 def plain_title_for_entry(node):
@@ -88,6 +123,25 @@ def detail_link_for_entry(node):
             text = clean_text(following.get_text(" ", strip=True))
             if is_detail_link(following.get("href")) and text and not CODE_ONLY_RE.fullmatch(text):
                 return following
+    return None
+
+
+def fallback_title_link_for_entry(node):
+    """Use a text-bearing external link when its provider is not recognized."""
+    for following in node.next_elements:
+        if isinstance(following, NavigableString) and RELEASE_DATE_RE.search(str(following)):
+            break
+        if not isinstance(following, Tag) or following.name != "a":
+            continue
+        text = clean_text(following.get_text(" ", strip=True))
+        href = following.get("href", "")
+        parsed = urlsplit(href)
+        if not text or CODE_ONLY_RE.fullmatch(text) or text.startswith("("):
+            continue
+        if parsed.scheme not in {"http", "https"} or parsed.hostname == "seesaawiki.jp":
+            continue
+        if "outlink" in (following.get("class") or []):
+            return following
     return None
 
 
@@ -148,18 +202,22 @@ def extract_page(url):
     rows = []
     seen = set()
     for node, release_date, code in release_entries(user_area):
-        detail_link = detail_link_for_entry(node)
+        detail_link = detail_link_for_entry(node) or fallback_title_link_for_entry(node)
         title = clean_text(detail_link.get_text(" ", strip=True)) if detail_link else ""
-        if not title and code.startswith("FC2"):
+        if not code and detail_link:
+            code = code_from_detail_url(detail_link.get("href", ""))
+        if not title and (not code or code.startswith("FC2")):
             title = plain_title_for_entry(node)
-        if not detail_link:
+        if not code and not title:
+            continue
+        if code and not detail_link:
             print(
                 f"Warning: {code} ({release_date}): no recognized title link; "
                 "retaining the code with blank detail_url.",
                 file=sys.stderr,
             )
         detail_url = detail_link.get("href", "") if detail_link else ""
-        key = (url, release_date, code, detail_url)
+        key = (url, release_date, code, title, detail_url)
         if key in seen:
             continue
         seen.add(key)
@@ -174,7 +232,7 @@ def extract_page(url):
             }
         )
     # Notes can reference releases without giving a date or title of their own.
-    known_codes = {row["code"].upper() for row in rows}
+    known_codes = {row["code"].upper() for row in rows if row["code"]}
     for link in user_area.find_all("a", href=True):
         code = clean_text(link.get_text(" ", strip=True))
         if not CODE_ONLY_RE.fullmatch(code) or not is_detail_link(link["href"]):

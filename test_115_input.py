@@ -1,8 +1,29 @@
 import contextlib
 import io
 import unittest
+from unittest.mock import Mock
 
-from check_115_exists import parse_codes, filename_is_uncensored
+from check_115_exists import parse_codes, filename_is_uncensored, select_115_tab, build_parser
+
+
+class ChromeTabTests(unittest.TestCase):
+    def test_uses_open_115_tab_from_correct_chrome_process(self):
+        old_profile = Mock()
+        old_tab = Mock()
+        old_tab.URL.return_value = "https://www.google.com/sorry/index"
+        old_profile.windows.return_value = [Mock(**{
+            "activeTab.return_value": old_tab, "tabs.return_value": [old_tab]
+        })]
+        normal_profile = Mock()
+        file_tab = Mock()
+        file_tab.URL.return_value = "https://115.com/?cid=0&mode=wangpan"
+        normal_profile.windows.return_value = [Mock(**{
+            "activeTab.return_value": file_tab, "tabs.return_value": [file_tab]
+        })]
+        self.assertEqual(select_115_tab([old_profile, normal_profile]), (normal_profile, file_tab))
+
+    def test_default_reuses_existing_chrome(self):
+        self.assertEqual(build_parser().parse_args(["UZU-021"]).browser, "existing")
 
 
 class SuffixTests(unittest.TestCase):

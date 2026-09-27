@@ -5,6 +5,70 @@ import extract_seesaawiki_codes as extractor
 
 
 class ExtractionTests(unittest.TestCase):
+    def test_dmm_numeric_studio_prefix_is_removed(self):
+        url = "https://www.dmm.co.jp/mono/dvd/-/detail/=/cid=h_701ap197/"
+        self.assertEqual(extractor.code_from_detail_url(url), "AP-197")
+        rows = self.extract(f'''<div class="user-area">2014/03/14<br>
+            <a class="outlink" href="{url}">Example title</a></div>''')
+        self.assertEqual(rows[0]["code"], "AP-197")
+
+    def test_common_dmm_compact_ids(self):
+        cases = {
+            "h_021clt00064": "CLT-064",
+            "13dsvr01847": "DSVR-1847",
+            "h_1133honb486": "HONB-486",
+            "orena110": "ORENA-110",
+            "savr00539": "SAVR-539",
+        }
+        for product_id, expected in cases.items():
+            with self.subTest(product_id=product_id):
+                self.assertEqual(extractor.compact_dmm_code(product_id), expected)
+
+    def test_other_provider_url_codes(self):
+        cases = {
+            "https://www.mgstage.com/product/product_detail/200GANA-2851/": "200GANA-2851",
+            "https://www.prestige-av.com/goods/goods_detail.php?sku=abw-112": "ABW-112",
+            "https://adult.contents.fc2.com/article/3582565/": "FC2-PPV-3582565",
+        }
+        for url, expected in cases.items():
+            with self.subTest(url=url):
+                self.assertEqual(extractor.code_from_detail_url(url), expected)
+
+    def test_unknown_or_image_url_has_no_derived_code(self):
+        for url in ["https://example.com/h_701ap197", "https://pics.dmm.co.jp/x.jpg",
+                    "https://www.mgstage.com/product/product_detail/not-a-code/"]:
+            with self.subTest(url=url):
+                self.assertEqual(extractor.code_from_detail_url(url), "")
+
+    def test_date_and_linked_title_without_code_is_retained(self):
+        rows = self.extract('''<div class="user-area">2014/03/14<br>
+            <a class="outlink" href="https://www.dmm.co.jp/mono/dvd/-/detail/=/cid=example001/">Title without code</a></div>''')
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["release_date"], "2014/03/14")
+        self.assertEqual(rows[0]["code"], "EXAMPLE-001")
+        self.assertEqual(rows[0]["title"], "Title without code")
+
+    def test_date_and_plain_title_without_code_is_retained(self):
+        rows = self.extract('<div class="user-area">2014/03/14<br>Plain title without code<br></div>')
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["code"], "")
+        self.assertEqual(rows[0]["title"], "Plain title without code")
+
+    def test_unknown_provider_title_is_retained(self):
+        rows = self.extract('''<div class="user-area">2014/03/14 EXAMPLE-001<br>
+            <a class="outlink" href="https://studio.example/releases/1">Studio title</a></div>''')
+        self.assertEqual(rows[0]["code"], "EXAMPLE-001")
+        self.assertEqual(rows[0]["title"], "Studio title")
+        self.assertEqual(rows[0]["detail_url"], "https://studio.example/releases/1")
+
+    def test_next_entry_title_is_not_borrowed(self):
+        rows = self.extract('''<div class="user-area">2014/03/14<br>
+            2014/03/13 EXAMPLE-001<br>
+            <a class="outlink" href="https://www.dmm.co.jp/mono/dvd/-/detail/=/cid=example001/">Next title</a></div>''')
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["code"], "EXAMPLE-001")
+        self.assertEqual(rows[0]["title"], "Next title")
+
     def test_non_padded_date(self):
         rows = self.extract('<div class="user-area">2026/5/27 HONB-486<br>Plain text</div>')
         self.assertEqual((rows[0]['code'], rows[0]['release_date']), ('HONB-486','2026/05/27'))
