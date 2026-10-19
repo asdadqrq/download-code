@@ -157,7 +157,8 @@ def open_browser(profile_dir: Path) -> tuple[subprocess.Popen, CdpClient]:
 
 
 def applescript_string(value: str) -> str:
-    return json.dumps(value)
+    # AppleScript does not accept JSON's \uXXXX escapes for Unicode text.
+    return json.dumps(value, ensure_ascii=False)
 
 
 def run_applescript(lines: list[str]) -> str:

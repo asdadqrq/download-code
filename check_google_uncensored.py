@@ -445,7 +445,9 @@ class ExistingChromeGoogleSearcher:
         while time.monotonic() < deadline:
             state = self.evaluate(script)
             if state.get('blocked'):
-                raise GoogleChallengeError('Google showed the unusual-traffic page. Stop the batch; complete verification in Chrome and rerun the unresolved codes.')
+                raise GoogleChallengeError(
+                    'Google showed the unusual-traffic page.'
+                )
             if state.get('ready'):
                 return [dict(item, link=normalize_google_link(item['link']))
                         for item in state['results'] if is_search_result_url(normalize_google_link(item['link']))]
@@ -714,97 +716,139 @@ def find_match(code, results):
     return "", {}
 
 
-def check_codes(codes, limit=10, delay=2.0, browser_searcher=None):
+def wait_for_google_verification(error):
+    print(f"\n{error}", file=sys.stderr)
+    print(
+        "Complete Google's identity verification in the open Chrome tab(s).",
+        file=sys.stderr,
+    )
+    try:
+        input("After Google results are visible again, press Enter to continue... ")
+    except EOFError as exc:
+        raise GoogleChallengeError(
+            "Google verification is required, but this run has no interactive input."
+        ) from exc
+
+
+def check_codes(codes, limit=10, delay=2.0, browser_searcher=None,
+                challenge_handler=None):
     rows = []
     for i, code in enumerate(codes, start=1):
         query = f"{code} uncensored"
-        try:
-            if browser_searcher:
-                results = browser_searcher.search(query, limit=limit)
-                search_method = getattr(browser_searcher, 'method', 'google_chrome')
-            else:
-                results, search_method = search_google(query, limit=limit)
-            match_rank, match = find_match(code, results)
-            if not relevant_results(code, results):
-                matched = "unknown"
-                error = "Search returned no relevant result blocks for the exact code."
-            else:
-                matched = "yes" if match else "no"
-                error = ""
-            rows.append(
-                {
-                    "code": code,
-                    "query": query,
-                    "matched": matched,
-                    "match_rank": match_rank,
-                    "match_title": match.get("title", ""),
-                    "match_url": match.get("link", ""),
-                    "match_snippet": match.get("snippet", ""),
-                    "result_count_checked": len(results),
-                    "search_method": search_method,
-                    "google_url": GOOGLE_SEARCH_URL.format(query=quote_plus(query), num=limit),
-                    "error": error,
-                }
-            )
-        except GoogleTabRequiredError:
-            raise
-        except GoogleChallengeError as exc:
-            message = str(exc)
-            for remaining_code in codes[i - 1:]:
-                remaining_query = f"{remaining_code} uncensored"
-                rows.append({
-                    "code": remaining_code,
-                    "query": remaining_query,
-                    "matched": "unknown",
-                    "match_rank": "",
-                    "match_title": "",
-                    "match_url": "",
-                    "match_snippet": "",
-                    "result_count_checked": 0,
-                    "search_method": getattr(browser_searcher, 'method', 'google_chrome'),
-                    "google_url": GOOGLE_BROWSER_URL.format(query=quote_plus(remaining_query), num=limit),
-                    "error": message if remaining_code == code else "Not searched after Google stopped the batch.",
-                })
-            print(f"{i}/{len(codes)} {code}: unknown (Google stopped the batch)")
-            break
-        except Exception as exc:
-            rows.append(
-                {
-                    "code": code,
-                    "query": query,
-                    "matched": "error",
-                    "match_rank": "",
-                    "match_title": "",
-                    "match_url": "",
-                    "match_snippet": "",
-                    "result_count_checked": 0,
-                    "search_method": "",
-                    "google_url": GOOGLE_SEARCH_URL.format(query=quote_plus(query), num=limit),
-                    "error": str(exc),
-                }
-            )
+        while True:
+            try:
+                if browser_searcher:
+                    results = browser_searcher.search(query, limit=limit)
+                    search_method = getattr(browser_searcher, 'method', 'google_chrome')
+                else:
+                    results, search_method = search_google(query, limit=limit)
+                match_rank, match = find_match(code, results)
+                if not relevant_results(code, results):
+                    matched = "unknown"
+                    error = "Search returned no relevant result blocks for the exact code."
+                else:
+                    matched = "yes" if match else "no"
+                    error = ""
+                rows.append(
+                    {
+                        "code": code,
+                        "query": query,
+                        "matched": matched,
+                        "match_rank": match_rank,
+                        "match_title": match.get("title", ""),
+                        "match_url": match.get("link", ""),
+                        "match_snippet": match.get("snippet", ""),
+                        "result_count_checked": len(results),
+                        "search_method": search_method,
+                        "google_url": GOOGLE_SEARCH_URL.format(query=quote_plus(query), num=limit),
+                        "error": error,
+                    }
+                )
+                break
+            except GoogleTabRequiredError:
+                raise
+            except GoogleChallengeError as exc:
+                if challenge_handler is not None:
+                    challenge_handler(exc)
+                    print(f"Retrying {code}...")
+                    continue
+                message = str(exc)
+                for remaining_code in codes[i - 1:]:
+                    remaining_query = f"{remaining_code} uncensored"
+                    rows.append({
+                        "code": remaining_code,
+                        "query": remaining_query,
+                        "matched": "unknown",
+                        "match_rank": "",
+                        "match_title": "",
+                        "match_url": "",
+                        "match_snippet": "",
+                        "result_count_checked": 0,
+                        "search_method": getattr(browser_searcher, 'method', 'google_chrome'),
+                        "google_url": GOOGLE_BROWSER_URL.format(query=quote_plus(remaining_query), num=limit),
+                        "error": message if remaining_code == code else "Not searched after Google stopped the batch.",
+                    })
+                print(f"{i}/{len(codes)} {code}: unknown (Google stopped the batch)")
+                return rows
+            except Exception as exc:
+                rows.append(
+                    {
+                        "code": code,
+                        "query": query,
+                        "matched": "error",
+                        "match_rank": "",
+                        "match_title": "",
+                        "match_url": "",
+                        "match_snippet": "",
+                        "result_count_checked": 0,
+                        "search_method": "",
+                        "google_url": GOOGLE_SEARCH_URL.format(query=quote_plus(query), num=limit),
+                        "error": str(exc),
+                    }
+                )
+                break
         print(f"{i}/{len(codes)} {code}: {rows[-1]['matched']}")
         if i < len(codes) and delay > 0:
             time.sleep(delay)
     return rows
 
 
-def check_codes_parallel(codes, searchers, limit=4, delay=4.0):
+def check_code_after_stagger(code, searcher, limit, stagger_seconds):
+    if stagger_seconds > 0:
+        time.sleep(stagger_seconds)
+    return check_codes([code], limit, 0, searcher)
+
+
+def check_codes_parallel(codes, searchers, limit=4, delay=4.0,
+                         challenge_handler=None, stagger=0.0):
     rows = []
     workers = len(searchers)
     for start in range(0, len(codes), workers):
         batch = codes[start:start + workers]
-        with ThreadPoolExecutor(max_workers=len(batch)) as executor:
-            futures = [
-                executor.submit(check_codes, [code], limit, 0, searchers[index])
-                for index, code in enumerate(batch)
-            ]
-            batch_rows = [future.result()[0] for future in futures]
-        rows.extend(batch_rows)
-        challenge = next(
-            (row["error"] for row in batch_rows if "unusual-traffic" in row["error"]),
-            None,
-        )
+        while True:
+            with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                futures = [
+                    executor.submit(
+                        check_code_after_stagger,
+                        code,
+                        searchers[index],
+                        limit,
+                        index * max(0.0, stagger),
+                    )
+                    for index, code in enumerate(batch)
+                ]
+                batch_rows = [future.result()[0] for future in futures]
+            challenge = next(
+                (row["error"] for row in batch_rows
+                 if "unusual-traffic" in row["error"] or "unusual traffic" in row["error"]),
+                None,
+            )
+            if challenge and challenge_handler is not None:
+                challenge_handler(GoogleChallengeError(challenge))
+                print("Retrying interrupted search batch...")
+                continue
+            rows.extend(batch_rows)
+            break
         if challenge:
             for code in codes[start + len(batch):]:
                 query = f"{code} uncensored"
@@ -833,6 +877,10 @@ def main():
     parser.add_argument("--delay", type=float, default=4.0, help="Seconds to wait between search batches")
     parser.add_argument("--workers", type=int, choices=[1, 2], default=2,
                         help="Number of existing Google tabs used in parallel")
+    parser.add_argument(
+        "--stagger", type=float, default=2.0,
+        help="Seconds between starting searches in separate Google tabs (default: 2)",
+    )
     parser.add_argument(
         "--browser",
         choices=["auto", "none", "chrome", "safari"],
@@ -867,14 +915,20 @@ def main():
                 for app, tab in selected
             ]
             rows = check_codes_parallel(
-                codes, searchers, limit=args.limit, delay=args.delay
+                codes, searchers, limit=args.limit, delay=args.delay,
+                challenge_handler=wait_for_google_verification,
+                stagger=args.stagger,
             )
         except GoogleTabRequiredError as exc:
             parser.exit(2, f"{exc}\n")
     else:
         try:
             with ChromeGoogleSearcher(chrome_path=args.chrome_path, wait_seconds=args.browser_wait) as searcher:
-                rows = check_codes(codes, limit=args.limit, delay=args.delay, browser_searcher=searcher)
+                rows = check_codes(
+                    codes, limit=args.limit, delay=args.delay,
+                    browser_searcher=searcher,
+                    challenge_handler=wait_for_google_verification,
+                )
         except Exception as exc:
             if args.browser == "chrome":
                 raise

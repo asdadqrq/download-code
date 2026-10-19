@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import Mock, patch
 from threading import Barrier
+import time
 
 import check_google_uncensored as checker
 
@@ -26,6 +27,25 @@ class ProviderPriorityTests(unittest.TestCase):
         self.assertEqual([row['code'] for row in rows], ['AAA-001', 'BBB-002'])
         self.assertEqual([row['matched'] for row in rows], ['yes', 'yes'])
         self.assertEqual(seen_limits, [4, 4])
+
+    def test_parallel_search_staggers_second_tab(self):
+        started = {}
+
+        class Browser:
+            method = 'google_chrome'
+
+            def search(self, query, limit=10):
+                code = query.split()[0]
+                started[code] = time.monotonic()
+                return [{'title': f'{code} [Uncensored Leaked]', 'snippet': '',
+                         'link': f'https://example.com/{code}-decensored'}]
+
+        rows = checker.check_codes_parallel(
+            ['AAA-001', 'BBB-002'], [Browser(), Browser()],
+            delay=0, stagger=0.05,
+        )
+        self.assertEqual([row['matched'] for row in rows], ['yes', 'yes'])
+        self.assertGreaterEqual(started['BBB-002'] - started['AAA-001'], 0.04)
 
     def test_parallel_challenge_stops_later_batches(self):
         class Blocked:
@@ -63,6 +83,62 @@ class ProviderPriorityTests(unittest.TestCase):
         self.assertEqual([row['matched'] for row in rows], ['unknown', 'unknown'])
         self.assertIn('unusual traffic', rows[0]['error'])
         self.assertIn('Not searched', rows[1]['error'])
+
+    def test_interactive_challenge_handler_retries_same_code(self):
+        class BlockedOnceBrowser:
+            method = 'google_chrome'
+
+            def __init__(self):
+                self.calls = 0
+
+            def search(self, query, limit=10):
+                self.calls += 1
+                if self.calls == 1:
+                    raise checker.GoogleChallengeError('Google unusual-traffic challenge')
+                code = query.split()[0]
+                return [{
+                    'title': f'{code} [Uncensored Leaked]',
+                    'snippet': '',
+                    'link': f'https://example.com/{code}-decensored',
+                }]
+
+        browser = BlockedOnceBrowser()
+        challenges = []
+        rows = checker.check_codes(
+            ['MDBK-380'], delay=0, browser_searcher=browser,
+            challenge_handler=challenges.append,
+        )
+        self.assertEqual(browser.calls, 2)
+        self.assertEqual(len(challenges), 1)
+        self.assertEqual(rows[0]['matched'], 'yes')
+
+    def test_parallel_challenge_pauses_once_and_retries_batch(self):
+        class BlockedOnceBrowser:
+            method = 'google_chrome'
+
+            def __init__(self):
+                self.calls = 0
+
+            def search(self, query, limit=10):
+                self.calls += 1
+                if self.calls == 1:
+                    raise checker.GoogleChallengeError('Google unusual-traffic challenge')
+                code = query.split()[0]
+                return [{
+                    'title': f'{code} [Uncensored Leaked]',
+                    'snippet': '',
+                    'link': f'https://example.com/{code}-decensored',
+                }]
+
+        browsers = [BlockedOnceBrowser(), BlockedOnceBrowser()]
+        challenges = []
+        rows = checker.check_codes_parallel(
+            ['AAA-001', 'BBB-002'], browsers, delay=0,
+            challenge_handler=challenges.append,
+        )
+        self.assertEqual([browser.calls for browser in browsers], [2, 2])
+        self.assertEqual(len(challenges), 1)
+        self.assertEqual([row['matched'] for row in rows], ['yes', 'yes'])
 
     def test_existing_query_tab_is_read_without_reloading(self):
         browser = checker.ExistingChromeGoogleSearcher()
