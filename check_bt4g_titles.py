@@ -30,7 +30,21 @@ READ_RESULTS = r"""
   const results = links.filter(a => {
     const u = new URL(a.href, location.href);
     return u.origin === location.origin && /^\/(magnet|hash)\//.test(u.pathname);
-  }).map(a => ({title: a.textContent.trim(), url: a.href}))
+  }).map(a => {
+    let size = '';
+    // Walk up only within this result, excluding the title from size matching.
+    for (let node = a.parentElement; node && node !== document.body; node = node.parentElement) {
+      const resultUrls = new Set([...node.querySelectorAll('a[href]')]
+        .filter(x => /^\/(magnet|hash)\//.test(new URL(x.href, location.href).pathname))
+        .map(x => x.href));
+      if (resultUrls.size > 1) break;
+      const copy = node.cloneNode(true);
+      copy.querySelectorAll('a[href]').forEach(x => x.remove());
+      const match = copy.textContent.match(/\b(\d+(?:[.,]\d+)?)\s*(TiB|GiB|MiB|KiB|TB|GB|MB|KB|B)\b/i);
+      if (match) { size = match[0]; break; }
+    }
+    return {title: a.textContent.trim(), url: a.href, size};
+  })
     .filter(a => a.title);
   return {results};
 })()
@@ -39,6 +53,16 @@ READ_RESULTS = r"""
 
 def match_title(title: str) -> list[str]:
     return [marker for marker, pattern in PATTERNS.items() if pattern.search(title)]
+
+
+def size_bytes(size: str) -> float | None:
+    match = re.fullmatch(r"\s*(\d+(?:[.,]\d+)?)\s*(TiB|GiB|MiB|KiB|TB|GB|MB|KB|B)\s*", size, re.IGNORECASE)
+    if not match:
+        return None
+    unit = match.group(2).upper()
+    power = {"B": 0, "KB": 1, "MB": 2, "GB": 3, "TB": 4,
+             "KIB": 1, "MIB": 2, "GIB": 3, "TIB": 4}[unit]
+    return float(match.group(1).replace(",", ".")) * (1024 if "I" in unit else 1000) ** power
 
 
 def search(client, code: str) -> dict:
@@ -52,6 +76,7 @@ def search(client, code: str) -> dict:
         "titles_checked": 0,
         "contains": {marker: False for marker in PATTERNS},
         "matches": [],
+        "results": [],
         "error": "",
     }
     seen_results = set()
@@ -71,11 +96,15 @@ def search(client, code: str) -> dict:
                 continue
             seen_results.add(item["url"])
             result["titles_checked"] += 1
+            result["results"].append({**item, "size_bytes": size_bytes(item.get("size", ""))})
             markers = match_title(item["title"])
             if markers:
                 result["matches"].append({**item, "markers": markers})
                 for marker in markers:
                     result["contains"][marker] = True
+        if not result["matches"] and result["results"]:
+            if any(item["size_bytes"] is None for item in result["results"]):
+                result["error"] = "Largest-file fallback unavailable: could not read every result's file size"
     except (RuntimeError, OSError, ValueError, VerificationRequired) as exc:
         result["status"] = "incomplete"
         result["error"] = str(exc)
@@ -95,11 +124,14 @@ def found_value(row: dict) -> str:
 
 
 def preferred_link(row: dict) -> str:
-    """Use the first result within the highest-priority marker group."""
+    """Prefer marker priority, otherwise the largest first-page result."""
     priorities = {"U": 0, "UC": 0, "AI": 1, "UNCENSORED": 2}
     matches = row["matches"]
     if not matches:
-        return ""
+        results = row.get("results", [])
+        if not results or any(item.get("size_bytes") is None for item in results):
+            return ""
+        return max(results, key=lambda item: item["size_bytes"])["url"]
     best = min(matches, key=lambda item: min(
         (priorities.get(marker.lstrip("-").upper(), 3)
          for marker in item["markers"]),
