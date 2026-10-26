@@ -2,11 +2,44 @@ import unittest
 from unittest.mock import Mock, patch
 from threading import Barrier
 import time
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import check_google_uncensored as checker
 
 
 class ProviderPriorityTests(unittest.TestCase):
+    def test_main_reuses_one_tab_for_sequential_searches(self):
+        browser = Mock(method='google_chrome')
+        browser.search.side_effect = lambda query, limit: [{
+            'title': query, 'snippet': '',
+            'link': 'https://example.com/' + query.split()[0],
+        }]
+        with TemporaryDirectory() as directory:
+            output = Path(directory) / 'results.csv'
+            with patch.object(checker.sys, 'argv', [
+                'check_google_uncensored.py', 'AAA-001,BBB-002',
+                '--delay', '0', '-o', str(output),
+            ]), patch.object(checker.sys, 'platform', 'darwin'), \
+                    patch.object(checker, 'ExistingChromeGoogleSearcher') as searcher_class, \
+                    patch.object(checker, 'check_codes_parallel') as parallel:
+                app, tab = Mock(), Mock()
+                searcher_class.select_tabs.return_value = [(app, tab)]
+                searcher_class.return_value = browser
+                checker.main()
+                searcher_class.select_tabs.assert_called_once_with(
+                    ['AAA-001 uncensored', 'BBB-002 uncensored'], 1,
+                )
+                searcher_class.assert_called_once_with(
+                    wait_seconds=4.0, app=app, tab=tab, timeout=30.0, retries=1,
+                )
+                self.assertEqual(
+                    [call.args[0] for call in browser.search.call_args_list],
+                    ['AAA-001 uncensored', 'BBB-002 uncensored'],
+                )
+                parallel.assert_not_called()
+                self.assertTrue(output.exists())
+
     def test_parallel_search_preserves_order_and_limit(self):
         barrier = Barrier(2)
         seen_limits = []
@@ -147,6 +180,51 @@ class ProviderPriorityTests(unittest.TestCase):
         with patch.object(browser, 'select_tab', return_value=(Mock(), tab)), \
                 patch.object(browser, 'evaluate', return_value={'ready': True, 'results': [], 'blocked': False}):
             self.assertEqual(browser.search('MDBK-380 uncensored'), [])
+        tab.setURL_.assert_not_called()
+
+    def test_loading_timeout_retries_in_the_same_tab(self):
+        tab = Mock()
+        tab.URL.return_value = 'https://www.google.com/search?q=MDBK-380+uncensored&hl=en'
+        browser = checker.ExistingChromeGoogleSearcher(tab=tab, timeout=1, retries=1)
+        result = {'title':'MDBK-380 uncensored', 'link':'https://example.com/mdbk-380'}
+        with patch.object(browser, 'evaluate', side_effect=[
+            {'ready':False}, {'ready':True, 'results':[result]},
+        ]), patch.object(checker.time, 'monotonic', side_effect=[0, 0, 2, 3, 3]), \
+                patch.object(checker.time, 'sleep'):
+            self.assertEqual(browser.search('MDBK-380 uncensored'), [result])
+        tab.setURL_.assert_called_once()
+
+    def test_transient_document_read_failure_is_retried_without_navigation(self):
+        tab = Mock()
+        tab.URL.return_value = 'https://www.google.com/search?q=MDBK-380+uncensored'
+        browser = checker.ExistingChromeGoogleSearcher(tab=tab, timeout=1)
+        with patch.object(browser, 'evaluate', side_effect=[
+            ValueError('Document is navigating'), {'ready':True, 'results':[]},
+        ]), patch.object(checker.time, 'monotonic', side_effect=[0, 0, 0.5]), \
+                patch.object(checker.time, 'sleep'):
+            self.assertEqual(browser.search('MDBK-380 uncensored'), [])
+        tab.setURL_.assert_not_called()
+
+    def test_persistent_timeout_includes_document_diagnostics(self):
+        tab = Mock()
+        tab.URL.return_value = 'https://www.google.com/search?q=MDBK-380+uncensored'
+        browser = checker.ExistingChromeGoogleSearcher(tab=tab, timeout=1, retries=0)
+        state = {'ready':False, 'url':tab.URL(), 'title':'Loading...',
+                 'documentState':'loading', 'resultRoot':False}
+        with patch.object(browser, 'evaluate', return_value=state), \
+                patch.object(checker.time, 'monotonic', side_effect=[0, 0, 2]), \
+                patch.object(checker.time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'title=Loading.*document=loading'):
+                browser.search('MDBK-380 uncensored')
+
+    def test_challenge_is_not_automatically_reloaded(self):
+        tab = Mock()
+        tab.URL.return_value = 'https://www.google.com/search?q=MDBK-380+uncensored'
+        browser = checker.ExistingChromeGoogleSearcher(tab=tab)
+        for state in [{'blocked':True}, {'consent':True}]:
+            with self.subTest(state=state), patch.object(browser, 'evaluate', return_value=state):
+                with self.assertRaises(checker.GoogleChallengeError):
+                    browser.search('MDBK-380 uncensored')
         tab.setURL_.assert_not_called()
 
     def test_cosx_release_metadata_confirms_explicit_label(self):

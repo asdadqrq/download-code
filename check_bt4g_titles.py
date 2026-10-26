@@ -65,13 +65,16 @@ def size_bytes(size: str) -> float | None:
     return float(match.group(1).replace(",", ".")) * (1024 if "I" in unit else 1000) ** power
 
 
-def search(client, code: str) -> dict:
+def search(client, code: str, size_rank: int = 1) -> dict:
+    if size_rank < 1:
+        raise ValueError("size_rank must be at least 1")
     url = f"{BASE_URL}/search?q={quote(code)}"
     result = {
         "code": code,
         "search_url": url,
         "status": "complete",
         "scope": "first_page",
+        "size_rank": size_rank,
         "pages_checked": 0,
         "titles_checked": 0,
         "contains": {marker: False for marker in PATTERNS},
@@ -104,7 +107,11 @@ def search(client, code: str) -> dict:
                     result["contains"][marker] = True
         if not result["matches"] and result["results"]:
             if any(item["size_bytes"] is None for item in result["results"]):
-                result["error"] = "Largest-file fallback unavailable: could not read every result's file size"
+                result["error"] = "Size-ranked fallback unavailable: could not read every result's file size"
+            elif size_rank > len(result["results"]):
+                result["error"] = (
+                    f"Size rank {size_rank} unavailable: only {len(result['results'])} first-page results"
+                )
     except (RuntimeError, OSError, ValueError, VerificationRequired) as exc:
         result["status"] = "incomplete"
         result["error"] = str(exc)
@@ -124,14 +131,17 @@ def found_value(row: dict) -> str:
 
 
 def preferred_link(row: dict) -> str:
-    """Prefer marker priority, otherwise the largest first-page result."""
+    """Prefer marker priority, otherwise the requested size rank on the first page."""
     priorities = {"U": 0, "UC": 0, "AI": 1, "UNCENSORED": 2}
     matches = row["matches"]
     if not matches:
         results = row.get("results", [])
-        if not results or any(item.get("size_bytes") is None for item in results):
+        rank = row.get("size_rank", 1)
+        if (not results or not 1 <= rank <= len(results)
+                or any(item.get("size_bytes") is None for item in results)):
             return ""
-        return max(results, key=lambda item: item["size_bytes"])["url"]
+        ranked = sorted(results, key=lambda item: item["size_bytes"], reverse=True)
+        return ranked[rank - 1]["url"]
     best = min(matches, key=lambda item: min(
         (priorities.get(marker.lstrip("-").upper(), 3)
          for marker in item["markers"]),
@@ -223,9 +233,15 @@ def main() -> None:
     parser.add_argument("codes", nargs="*", help="Comma- or space-separated IDs")
     parser.add_argument("-o", "--output", type=Path, default=Path("bt4g_title_results-1.csv"))
     parser.add_argument("--delay", type=float, default=1.5)
+    parser.add_argument(
+        "--size-rank", type=int, default=1,
+        help="When no marker matches, select by descending size: 1=largest (default), 2=second-largest, 3=third-largest",
+    )
     args = parser.parse_args()
     if args.delay < 0.5:
         parser.error("--delay must be at least 0.5")
+    if args.size_rank < 1:
+        parser.error("--size-rank must be at least 1")
     codes = parse_queries(args.codes or [input("Enter IDs (comma-separated): ")])
     client = CurrentChromeClient()
     rows = []
@@ -233,7 +249,7 @@ def main() -> None:
         for index, code in enumerate(codes):
             if index:
                 time.sleep(args.delay)
-            row = search(client, code)
+            row = search(client, code, size_rank=args.size_rank)
             add_torrent_hash(client, row)
             rows.append(row)
             print(f"{code}: {found_value(row)}")

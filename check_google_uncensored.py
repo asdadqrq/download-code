@@ -318,24 +318,32 @@ def google_result_script(query, limit):
       const expected = %QUERY%;
       const current = new URL(location.href);
       const text = document.body ? document.body.innerText : '';
+      const diagnostics = {
+        url: location.href, title: document.title,
+        documentState: document.readyState
+      };
       const blocked = current.pathname.startsWith('/sorry/') ||
-        /our systems have detected unusual traffic|this page checks to see if it's really you|verify you are human|not a robot/i.test(text);
-      if (blocked) return {ready:false, blocked:true, results:[]};
+        Boolean(document.querySelector('iframe[src*="recaptcha"], #captcha-form')) ||
+        /our systems have detected unusual traffic|this page checks to see if it's really you|verify you are human|not a robot|我们的系统检测到|異常なトラフィック/i.test(text);
+      if (blocked) return {...diagnostics, ready:false, blocked:true, results:[]};
+      if (current.hostname === 'consent.google.com' || current.hostname.startsWith('consent.google.'))
+        return {...diagnostics, ready:false, consent:true, results:[]};
       if (current.pathname !== '/search' || current.searchParams.get('q') !== expected)
-        return {ready:false, results:[]};
+        return {...diagnostics, ready:false, results:[]};
       const root = document.querySelector('#rso') || document.querySelector('#search');
       const rows = [];
       const seen = new Set();
-      for (const heading of root ? root.querySelectorAll('h3') : []) {
-        const anchor = heading.closest('a');
+      for (const heading of root ? root.querySelectorAll('h3, [role="heading"][aria-level="3"]') : []) {
+        const anchor = heading.closest('a') || heading.querySelector('a[href]');
         if (!anchor || !anchor.href || seen.has(anchor.href)) continue;
         seen.add(anchor.href);
         const block = heading.closest('.MjjYud') || heading.parentElement;
-        rows.push({title:heading.innerText.trim(), link:anchor.href,
+        rows.push({title:(heading.innerText || heading.textContent || '').trim(), link:anchor.href,
           snippet:(block.innerText || '').replace(/\s+/g,' ').trim()});
       }
-      const empty = /did not match any documents|no results found/i.test(text);
-      return {ready:rows.length > 0 || empty, blocked, results:rows.slice(0,%LIMIT%)};
+      const empty = /did not match any documents|no results found|找不到和您查询|未找到.*相关|一致する情報は見つかりませんでした/i.test(text);
+      return {...diagnostics, ready:rows.length > 0 || empty, blocked,
+        resultRoot: Boolean(root), results:rows.slice(0,%LIMIT%)};
     })()""".replace('%QUERY%', json.dumps(query)).replace('%LIMIT%', str(int(limit)))
 
 
@@ -343,8 +351,9 @@ class ExistingChromeGoogleSearcher:
     """Search an existing Google tab in the user's macOS Chrome profile."""
     method = "google_chrome"
 
-    def __init__(self, wait_seconds=4, app=None, tab=None):
-        self.timeout = max(15, wait_seconds + 10)
+    def __init__(self, wait_seconds=4, app=None, tab=None, timeout=None, retries=1):
+        self.timeout = timeout if timeout is not None else max(30, wait_seconds + 10)
+        self.retries = retries
         self.app = app
         self.tab = tab
 
@@ -407,8 +416,8 @@ class ExistingChromeGoogleSearcher:
                 candidates.append((5, app, window, added_tab))
         if len(candidates) < count:
             raise GoogleTabRequiredError(
-                "Open Google in Chrome, then rerun. The script will create "
-                "the additional worker page in that Chrome profile."
+                "Open Chrome, then rerun. The script will reuse one Google "
+                "tab or create one in that Chrome profile."
             )
         return [(app, tab) for _, app, _, tab in candidates[:count]]
 
@@ -440,19 +449,45 @@ class ExistingChromeGoogleSearcher:
         if (current_url.path != "/search"
                 or parse_qs(current_url.query).get("q", [None])[0] != query):
             self.tab.setURL_(url)
-        deadline = time.monotonic() + self.timeout
         script = google_result_script(query, limit)
-        while time.monotonic() < deadline:
-            state = self.evaluate(script)
-            if state.get('blocked'):
-                raise GoogleChallengeError(
-                    'Google showed the unusual-traffic page.'
-                )
-            if state.get('ready'):
-                return [dict(item, link=normalize_google_link(item['link']))
-                        for item in state['results'] if is_search_result_url(normalize_google_link(item['link']))]
-            time.sleep(0.5)
-        raise RuntimeError('Google result headings did not load in normal Chrome')
+        state = {}
+        last_read_error = ''
+        for attempt in range(self.retries + 1):
+            deadline = time.monotonic() + self.timeout
+            while time.monotonic() < deadline:
+                try:
+                    state = self.evaluate(script)
+                    if not isinstance(state, dict):
+                        raise RuntimeError('Chrome returned no readable document while loading')
+                    last_read_error = ''
+                except (RuntimeError, ValueError) as exc:
+                    # Navigation can temporarily invalidate a JavaScript read.
+                    last_read_error = str(exc)
+                    time.sleep(0.5)
+                    continue
+                if state.get('blocked'):
+                    raise GoogleChallengeError('Google showed the unusual-traffic page.')
+                if state.get('consent'):
+                    raise GoogleChallengeError('Google requires consent in the search tab.')
+                if state.get('ready'):
+                    return [dict(item, link=normalize_google_link(item['link']))
+                            for item in state['results'] if is_search_result_url(normalize_google_link(item['link']))]
+                time.sleep(0.5)
+            if attempt < self.retries:
+                print(f'Google did not finish loading {query}; retrying in the same tab...', flush=True)
+                time.sleep(2)
+                self.tab.setURL_(url)
+        details = '; '.join(filter(None, [
+            f"URL={state.get('url', self.tab.URL() or 'unknown')}",
+            f"title={state.get('title', 'unknown')}",
+            f"document={state.get('documentState', 'unknown')}",
+            f"result root={state.get('resultRoot', 'unknown')}",
+            last_read_error,
+        ]))
+        raise RuntimeError(
+            f'Google results did not load after {self.retries + 1} attempts '
+            f'({self.timeout}s per attempt). {details}'
+        )
 
 
 class SafariGoogleSearcher:
@@ -719,7 +754,7 @@ def find_match(code, results):
 def wait_for_google_verification(error):
     print(f"\n{error}", file=sys.stderr)
     print(
-        "Complete Google's identity verification in the open Chrome tab(s).",
+        "Resolve Google's verification or consent page in the open Chrome tab.",
         file=sys.stderr,
     )
     try:
@@ -808,6 +843,8 @@ def check_codes(codes, limit=10, delay=2.0, browser_searcher=None,
                 )
                 break
         print(f"{i}/{len(codes)} {code}: {rows[-1]['matched']}")
+        if rows[-1]['error']:
+            print(f"  {rows[-1]['error']}", file=sys.stderr)
         if i < len(codes) and delay > 0:
             time.sleep(delay)
     return rows
@@ -874,12 +911,12 @@ def main():
     parser.add_argument("--codes-file", help="Text file containing codes, one per line or comma-separated")
     parser.add_argument("-o", "--output", default="google_uncensored_check.csv", help="Output CSV path")
     parser.add_argument("--limit", type=int, default=4, help="Google results to check per code")
-    parser.add_argument("--delay", type=float, default=4.0, help="Seconds to wait between search batches")
-    parser.add_argument("--workers", type=int, choices=[1, 2], default=2,
-                        help="Number of existing Google tabs used in parallel")
+    parser.add_argument("--delay", type=float, default=4.0, help="Seconds to wait between searches")
+    parser.add_argument("--workers", type=int, choices=[1], default=1,
+                        help="Search sequentially in one Google tab (only 1 is supported)")
     parser.add_argument(
         "--stagger", type=float, default=2.0,
-        help="Seconds between starting searches in separate Google tabs (default: 2)",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--browser",
@@ -888,8 +925,12 @@ def main():
         help="auto/chrome use normal Chrome on macOS; none uses HTTP search providers",
     )
     parser.add_argument("--browser-wait", type=float, default=4.0, help="Seconds to wait after each Chrome search")
+    parser.add_argument("--browser-timeout", type=float, default=30.0, help="Maximum seconds to wait for each normal Chrome search attempt")
+    parser.add_argument("--browser-retries", type=int, default=1, help="Retries for result loading timeouts in the same tab")
     parser.add_argument("--chrome-path", help="Path to Chrome or Chromium executable")
     args = parser.parse_args()
+    if args.browser_timeout <= 0 or args.browser_retries < 0:
+        parser.error("--browser-timeout must be positive and --browser-retries must be non-negative")
 
     codes = split_codes(args.codes)
     if args.codes_file:
@@ -906,18 +947,16 @@ def main():
         try:
             selected = ExistingChromeGoogleSearcher.select_tabs(
                 [f"{code} uncensored" for code in codes],
-                min(args.workers, len(codes)),
+                1,
             )
-            searchers = [
-                ExistingChromeGoogleSearcher(
-                    wait_seconds=args.browser_wait, app=app, tab=tab
-                )
-                for app, tab in selected
-            ]
-            rows = check_codes_parallel(
-                codes, searchers, limit=args.limit, delay=args.delay,
+            app, tab = selected[0]
+            searcher = ExistingChromeGoogleSearcher(
+                wait_seconds=args.browser_wait, app=app, tab=tab,
+                timeout=args.browser_timeout, retries=args.browser_retries,
+            )
+            rows = check_codes(
+                codes, browser_searcher=searcher, limit=args.limit, delay=args.delay,
                 challenge_handler=wait_for_google_verification,
-                stagger=args.stagger,
             )
         except GoogleTabRequiredError as exc:
             parser.exit(2, f"{exc}\n")
