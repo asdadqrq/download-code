@@ -40,8 +40,9 @@ READ_RESULTS = r"""
       if (resultUrls.size > 1) break;
       const copy = node.cloneNode(true);
       copy.querySelectorAll('a[href]').forEach(x => x.remove());
-      const match = copy.textContent.match(/\b(\d+(?:[.,]\d+)?)\s*(TiB|GiB|MiB|KiB|TB|GB|MB|KB|B)\b/i);
-      if (match) { size = match[0]; break; }
+      const match = copy.textContent.match(/Total\s+Size\s*:\s*(\d+(?:[.,]\d+)?)\s*(TiB|GiB|MiB|KiB|TB|GB|MB|KB|B)\b/i)
+        || copy.textContent.match(/\b(\d+(?:[.,]\d+)?)\s*(TiB|GiB|MiB|KiB|TB|GB|MB|KB|B)\b/i);
+      if (match) { size = `${match[1]} ${match[2]}`; break; }
     }
     return {title: a.textContent.trim(), url: a.href, size};
   })
@@ -212,19 +213,25 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for row in rows:
+            link = preferred_link(row)
+            exported_matches = row["matches"]
+            if not exported_matches and row.get("torrent_hash") and link:
+                exported_matches = [
+                    item for item in row.get("results", []) if item["url"] == link
+                ]
             writer.writerow({
                 **{key: row[key] for key in (
                     "code", "status", "scope", "pages_checked", "titles_checked",
                     "search_url", "error",
                 )},
                 "found": found_value(row),
-                "preferred_link": preferred_link(row),
+                "preferred_link": link,
                 "torrent_hash": (
                     "magnet:?xt=urn:btih:" + row["torrent_hash"]
                     if row.get("torrent_hash") else ""
                 ),
-                "matching_titles": "\n".join(item["title"] for item in row["matches"]),
-                "matching_urls": "\n".join(item["url"] for item in row["matches"]),
+                "matching_titles": "\n".join(item["title"] for item in exported_matches),
+                "matching_urls": "\n".join(item["url"] for item in exported_matches),
             })
 
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "BT4G to 115"
+  short_description: "Three candidates, model review, and bounded 115 uploads"
+  default_prompt: "Use $bt4g-to-115 to collect three ranked title pages per code, review all titles semantically, then try approved videos over 900 MB in my specified 115 folder and report failed codes."

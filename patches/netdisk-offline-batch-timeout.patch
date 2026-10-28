@@ -1,0 +1,15 @@
+diff --git a/src/offline.ts b/src/offline.ts
+index 0c1e246..256f274 100644
+--- a/src/offline.ts
++++ b/src/offline.ts
+@@ -123,7 +123,9 @@ export class OfflineDownloader {
+       const execution = spawnSync(RSS2CLOUD_BIN, ['magnet', '--text', magnetFile, '--cid', targetFolderId], {
+         cwd: workDir,
+         encoding: 'utf8',
+-        timeout: 30000,
++        // Large round-based submissions must not inherit the single-link deadline.
++        // The caller reconciles each hash if even this bounded batch window expires.
++        timeout: Math.min(300000, Math.max(30000, magnetLinks.length * 3000)),
+         env: { ...process.env, GODEBUG: 'netdns=go' },
+       });
+       const result = `${execution.stdout || ''}\n${execution.stderr || ''}`.trim();

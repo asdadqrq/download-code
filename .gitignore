@@ -1,4 +1,5 @@
 __pycache__/
+.venv-bt4g-mcp/
 .idea/
 .DS_Store
 node_modules
