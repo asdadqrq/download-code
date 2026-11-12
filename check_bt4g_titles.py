@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Search BT4G in the selected Chrome tab and check first-page result titles."""
+"""Search all BT4G result pages in the selected Chrome tab for title markers."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import csv
 import re
 import time
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from check_bt4g_exists import (
     BASE_URL,
@@ -18,9 +18,14 @@ from check_bt4g_exists import (
     wait_for_result_cdp,
 )
 
-# Keep the trailing marker boundary to avoid matching longer suffixes.
+# Bare markers need both boundaries: the "ai" in "Thai" is not an AI label.
+# -U already includes its leading separator (e.g. SSNI-014-U).
 PATTERNS = {
-    marker: re.compile(re.escape(marker) + r"(?![a-z0-9])", re.IGNORECASE)
+    marker: re.compile(
+        (r"(?<![a-z0-9])" if not marker.startswith("-") else "")
+        + re.escape(marker) + r"(?![a-z0-9])",
+        re.IGNORECASE,
+    )
     for marker in ("-U", "UC", "uncensored", "AI")
 }
 
@@ -51,6 +56,26 @@ READ_RESULTS = r"""
 })()
 """
 
+READ_PAGINATION = "[...document.querySelectorAll('a[href]')].map(a => a.href)"
+
+
+def next_result_page(links: list[str], current_url: str, code: str) -> str:
+    current_page = int(parse_qs(urlsplit(current_url).query).get("p", ["1"])[0])
+    later_pages = {}
+    for link in links:
+        parsed = urlsplit(link)
+        query = parse_qs(parsed.query)
+        page = query.get("p", [""])
+        if (parsed.scheme == "https" and parsed.netloc == urlsplit(BASE_URL).netloc
+                and parsed.path == "/search" and query.get("q") == [code]
+                and len(page) == 1 and page[0].isdigit() and int(page[0]) > current_page):
+            later_pages[int(page[0])] = parsed._replace(fragment="").geturl()
+    if current_page + 1 in later_pages:
+        return later_pages[current_page + 1]
+    if later_pages:
+        raise RuntimeError("Next search page is missing; search is incomplete")
+    return ""
+
 
 def match_title(title: str) -> list[str]:
     return [marker for marker, pattern in PATTERNS.items() if pattern.search(title)]
@@ -66,7 +91,7 @@ def size_bytes(size: str) -> float | None:
     return float(match.group(1).replace(",", ".")) * (1024 if "I" in unit else 1000) ** power
 
 
-def search(client, code: str, size_rank: int = 1) -> dict:
+def search(client, code: str, size_rank: int = 1, delay: float = 1.5) -> dict:
     if size_rank < 1:
         raise ValueError("size_rank must be at least 1")
     url = f"{BASE_URL}/search?q={quote(code)}"
@@ -74,7 +99,7 @@ def search(client, code: str, size_rank: int = 1) -> dict:
         "code": code,
         "search_url": url,
         "status": "complete",
-        "scope": "first_page",
+        "scope": "all_pages",
         "size_rank": size_rank,
         "pages_checked": 0,
         "titles_checked": 0,
@@ -84,35 +109,44 @@ def search(client, code: str, size_rank: int = 1) -> dict:
         "error": "",
     }
     seen_results = set()
+    seen_pages = set()
+    page_signatures = set()
     try:
-        if client.evaluate("location.href") != url:
-            client.call("Page.navigate", {"url": url})
-        state = wait_for_result_cdp(client, url)
-        while state.get("blocked"):
-            input("Complete verification in the same Chrome tab, then press Enter: ")
+        while url:
+            if url in seen_pages:
+                raise RuntimeError("Search pagination repeated a page")
+            seen_pages.add(url)
+            if client.evaluate("location.href") != url:
+                client.call("Page.navigate", {"url": url})
             state = wait_for_result_cdp(client, url)
-        page = client.evaluate(READ_RESULTS)
-        if state.get("count", 0) > 0 and not page["results"]:
-            raise RuntimeError("Results exist but title links were not recognized; selectors may have changed")
-        result["pages_checked"] = 1
-        for item in page["results"]:
-            if item["url"] in seen_results:
-                continue
-            seen_results.add(item["url"])
-            result["titles_checked"] += 1
-            result["results"].append({**item, "size_bytes": size_bytes(item.get("size", ""))})
-            markers = match_title(item["title"])
-            if markers:
-                result["matches"].append({**item, "markers": markers})
-                for marker in markers:
-                    result["contains"][marker] = True
-        if not result["matches"] and result["results"]:
-            if any(item["size_bytes"] is None for item in result["results"]):
-                result["error"] = "Size-ranked fallback unavailable: could not read every result's file size"
-            elif size_rank > len(result["results"]):
-                result["error"] = (
-                    f"Size rank {size_rank} unavailable: only {len(result['results'])} first-page results"
-                )
+            while state.get("blocked"):
+                input("Complete verification in the same Chrome tab, then press Enter: ")
+                state = wait_for_result_cdp(client, url)
+            page = client.evaluate(READ_RESULTS)
+            links = client.evaluate(READ_PAGINATION)
+            if state.get("count", 0) > 0 and not page["results"]:
+                raise RuntimeError("Results exist but title links were not recognized; selectors may have changed")
+            signature = tuple(sorted(item["url"] for item in page["results"]))
+            if signature and signature in page_signatures:
+                raise RuntimeError("Search pagination repeated the same results")
+            page_signatures.add(signature)
+            result["pages_checked"] += 1
+            for item in page["results"]:
+                if item["url"] in seen_results:
+                    continue
+                seen_results.add(item["url"])
+                result["titles_checked"] += 1
+                result["results"].append({**item, "size_bytes": size_bytes(item.get("size", ""))})
+                markers = match_title(item["title"])
+                if markers:
+                    result["matches"].append({**item, "markers": markers})
+                    for marker in markers:
+                        result["contains"][marker] = True
+            url = next_result_page(links, url, code)
+            if url:
+                time.sleep(delay)
+            elif state.get("count", 0) > result["titles_checked"]:
+                raise RuntimeError("Not all reported results could be read; pagination may have changed")
     except (RuntimeError, OSError, ValueError, VerificationRequired) as exc:
         result["status"] = "incomplete"
         result["error"] = str(exc)
@@ -132,17 +166,11 @@ def found_value(row: dict) -> str:
 
 
 def preferred_link(row: dict) -> str:
-    """Prefer marker priority, otherwise the requested size rank on the first page."""
+    """Select a marker match; skip normal versions when none match."""
     priorities = {"U": 0, "UC": 0, "AI": 1, "UNCENSORED": 2}
     matches = row["matches"]
     if not matches:
-        results = row.get("results", [])
-        rank = row.get("size_rank", 1)
-        if (not results or not 1 <= rank <= len(results)
-                or any(item.get("size_bytes") is None for item in results)):
-            return ""
-        ranked = sorted(results, key=lambda item: item["size_bytes"], reverse=True)
-        return ranked[rank - 1]["url"]
+        return ""
     best = min(matches, key=lambda item: min(
         (priorities.get(marker.lstrip("-").upper(), 3)
          for marker in item["markers"]),
@@ -242,7 +270,7 @@ def main() -> None:
     parser.add_argument("--delay", type=float, default=1.5)
     parser.add_argument(
         "--size-rank", type=int, default=1,
-        help="When no marker matches, select by descending size: 1=largest (default), 2=second-largest, 3=third-largest",
+        help="Legacy option accepted for compatibility; normal-version fallback is disabled",
     )
     args = parser.parse_args()
     if args.delay < 0.5:
@@ -256,7 +284,7 @@ def main() -> None:
         for index, code in enumerate(codes):
             if index:
                 time.sleep(args.delay)
-            row = search(client, code, size_rank=args.size_rank)
+            row = search(client, code, size_rank=args.size_rank, delay=args.delay)
             add_torrent_hash(client, row)
             rows.append(row)
             print(f"{code}: {found_value(row)}")
