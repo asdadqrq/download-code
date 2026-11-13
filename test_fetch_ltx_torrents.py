@@ -18,6 +18,32 @@ def item(digest='a'*40, **changes):
 
 
 class FetchTests(unittest.TestCase):
+    def test_new_item_is_immediately_first_and_code_is_blank(self):
+        with TemporaryDirectory() as directory:
+            path=Path(directory)/'output.csv'
+            store=CsvStore(path)
+            store.add(item('a'*40))
+            store.add(item('b'*40,code='must remain empty'))
+            with path.open(encoding='utf-8-sig',newline='') as handle:
+                reader=csv.DictReader(handle)
+                self.assertEqual(reader.fieldnames[0],'code')
+                rows=list(reader)
+            self.assertEqual([r['info_hash'] for r in rows],['b'*40,'a'*40])
+            self.assertTrue(all(r['code']=='' for r in rows))
+
+    def test_existing_user_filled_codes_are_preserved(self):
+        with TemporaryDirectory() as directory:
+            path=Path(directory)/'existing.csv'
+            with path.open('w',encoding='utf-8-sig',newline='') as handle:
+                writer=csv.DictWriter(handle,fieldnames=['title','code','magnet'])
+                writer.writeheader()
+                writer.writerow({'title':'Old LTX title','code':'MANUAL-001','magnet':'magnet:?xt=urn:btih:'+'a'*40})
+            store=CsvStore(path)
+            store.add(item('b'*40))
+            with path.open(encoding='utf-8-sig',newline='') as handle:rows=list(csv.DictReader(handle))
+            self.assertEqual(rows[0]['code'],'')
+            self.assertEqual(rows[1]['code'],'MANUAL-001')
+
     def test_bt4g_incremental_does_not_resolve_older_details(self):
         with TemporaryDirectory() as directory:
             path=Path(directory)/'existing.csv'
@@ -154,7 +180,7 @@ class FetchTests(unittest.TestCase):
             self.assertFalse(store.add(item('c'*40,create_time='2022-01-01')))
             self.assertTrue(store.add(item('d'*40)))
             with path.open(encoding='utf-8-sig',newline='') as f:rows=list(csv.DictReader(f))
-            self.assertEqual(rows[0]['note'],'keep, 中文')
+            self.assertEqual(rows[1]['note'],'keep, 中文')
             self.assertEqual(len(rows),2)
 
     def test_sukebei_rows_and_next_page(self):

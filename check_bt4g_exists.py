@@ -264,7 +264,15 @@ class CurrentChromeClient:
     def call(self, method: str, params: dict):
         if method != "Page.navigate":
             raise ValueError(f"Unsupported operation: {method}")
-        self._run(f"set URL of targetTab to {applescript_string(params['url'])}")
+        # Chrome can show its window when an Apple event sets a tab's URL.
+        # Navigate inside the pinned page instead, acknowledging the request
+        # before the document unloads. This also applies to same-URL retries.
+        script = """(() => {
+          window.setTimeout(() => window.location.assign(%URL%), 0);
+          return 'navigation_scheduled';
+        })()""".replace("%URL%", json.dumps(params["url"], ensure_ascii=False))
+        if self.evaluate(script) != "navigation_scheduled":
+            raise RuntimeError("Chrome did not acknowledge background navigation")
 
     def close(self):
         pass  # The user's tab must remain open.

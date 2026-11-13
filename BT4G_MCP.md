@@ -53,6 +53,12 @@ by the original scripts. The server never changes this setting. If BT4G shows
 verification, complete it yourself and retry. No interactive stdin prompts
 are used, because stdin belongs to MCP.
 
+Searches, pagination, detail-page reads, and retries navigate inside the pinned
+page with JavaScript. They do not set Chrome's tab URL through Apple events,
+activate Chrome, or select another tab. An unacknowledged navigation is an error;
+there is no foreground-navigation fallback. Restart the BT4G MCP connection after
+updating the Python files so an already-running server loads this change.
+
 The default search returns the first exact match with a readable detail hash.
 It does not rank by seeders or size. `not_found` means all available search
 pages were checked; other failure/limit statuses cannot establish absence.

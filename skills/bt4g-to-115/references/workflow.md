@@ -94,8 +94,8 @@ other folders are left untouched and do not satisfy this destination.
 
 - `failed_codes.txt`: comma-separated codes that did not complete, including
   ignored and blocked cases. Detailed outcome/reason data stays in receipts.
-- `final_results_v2.md`: reviewed successful titles, title pages, magnets and
-  per-code outcome; no unsupported claim of content authenticity.
+- `final_results_v2.md`: reviewed successful titles, title pages, magnets,
+  receipt and per-code outcome; no unsupported claim of content authenticity.
 - `successful_magnets_v2.txt`: completed results only.
 - `receipts_v2.json`: immutable review binding and resumable attempt history.
 
@@ -104,6 +104,17 @@ In the final chat response, paste the combined skipped/failed codes from
 and excluding completed codes. Label it `Skipped/failed codes:` and use a
 single-line code block. Do not replace this list with a download link or counts.
 If every code completed, explicitly write `Skipped/failed codes: None`.
+
+### Destination filename listings
+
+**Optional: run this procedure only when the user explicitly requests actual downloaded filenames.** Default reports use reviewed BT4G titles, source links, magnets, and task outcomes. Do not issue folder-listing or filename-search requests for routine reports, resumption, or completion checks. Existing filename caches need not be refreshed.
+
+- Reconcile all attempted info hashes against each paginated offline-task snapshot together; do not perform a filename search or folder traversal per code to establish completion.
+- Persist filename listings incrementally in `destination_files.json`, keyed by account identity, destination folder ID, and task `file_id`, with entries per child folder ID and pagination cursor. Store no cookies. Reuse the same listing when multiple codes share a task folder.
+- Traverse each newly completed task directory and its subfolders once. Fetch each folder page once and cache successful pages immediately. Treat a listing as complete only after all pages and child folders are covered; preserve pagination metadata and partial results so a restart fetches only missing work.
+- On resume or report regeneration, read the cache first. Fetch only uncached folders/pages for newly completed tasks or previously incomplete listings. Do not re-traverse successful listings unless the user requests a refresh or there is evidence that the task's folder identity or contents changed.
+- A listing failure must never overwrite successful cached entries. Retry only missing/failed pages or folders, at most once per reporting run after a transient failure. On HTTP 405/429, authentication errors, or another service-wide rejection, stop further filename-listing requests for that run, preserve cached/partial results, and report reviewed BT4G title fallbacks for unavailable listings. A new cookie does not invalidate successful cached listings for the same account.
+- Report listing coverage and fallbacks separately from transfer outcomes. Listing failure does not downgrade a task already confirmed complete, and filename availability does not upgrade an unconfirmed task. Keep task-folder traversal by exact IDs; do not infer membership by matching code strings in filenames.
 
 ## Implementation and verification
 

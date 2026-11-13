@@ -98,14 +98,15 @@ def transfer_batch(backend, output, folder, *, clock=time.time, sleep=time.sleep
                 writes.append((row,a))
             active.append((row,a))
 
-        if writes:
+        for chunk_start in range(0,len(writes),115):
+            chunk=writes[chunk_start:chunk_start+115]
             started=clock()
-            unique={a['hash']:a['magnet'] for _,a in writes}
+            unique={a['hash']:a['magnet'] for _,a in chunk}
             receipt={'batch_id':len(report.setdefault('upload_batches',[]))+1,
-                     'codes':[row['code'] for row,_ in writes],
+                     'codes':[row['code'] for row,_ in chunk],
                      'magnets':list(unique.values()),'started_at':started,'status':'attempting'}
             report['upload_batches'].append(receipt)
-            for _,a in writes:
+            for _,a in chunk:
                 a.update(submission='attempting',started_at=started,batch_id=receipt['batch_id'])
             checkpoint()  # Every per-code receipt is durable before the single batch write.
             print('Submitting batch '+str(receipt['batch_id'])+': '+str(len(unique))+' magnets',flush=True)
@@ -113,10 +114,10 @@ def transfer_batch(backend, output, folder, *, clock=time.time, sleep=time.sleep
                 receipt['response']=backend.call('netdisk','offline_download',{
                     'magnet_links':list(unique.values()),'target_path':folder})
                 receipt['status']='accepted'
-                for _,a in writes:a['submission']='accepted'
+                for _,a in chunk:a['submission']='accepted'
             except Exception as exc:
                 receipt.update(status='unconfirmed',error=str(exc))
-                for _,a in writes:a.update(submission='unconfirmed',submission_error=str(exc))
+                for _,a in chunk:a.update(submission='unconfirmed',submission_error=str(exc))
                 checkpoint()
                 if any(s in str(exc).casefold() for s in ('quota','cookie','login expired','登录','配额','限额')):
                     raise RuntimeError('115 account/service blocker: '+str(exc)) from exc

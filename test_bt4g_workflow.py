@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import bt4g_workflow as w
+import bt4g_115_success_titles as title_reader
 
 
 def candidate(title='Release title',size=3_000_000_000,suffix='one'):
@@ -37,6 +38,17 @@ class Backend:
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_title_report_lists_task_folder_contents_without_code_filtering(self):
+        class ListClient:
+            def request(self,method,params):
+                folder=params['arguments']['path']
+                rows={'111':'1. [dir] Parts (ID: 222)\n2. [file] cover.jpg (ID: 333)',
+                      '222':'1. [file] video_part_01.mp4 (ID: 444)\n2. [file] unnamed_part.mkv (ID: 555)'}
+                return {'content':[{'type':'text','text':rows[folder]}]}
+        files=title_reader.list_task_directory(ListClient(),'111')
+        self.assertEqual([f['name'] for f in files],['Parts','video_part_01.mp4','unnamed_part.mkv','cover.jpg'])
+        self.assertEqual([f['id'] for f in files],['222','444','555','333'])
+
     def test_search_suffix_changes_query_not_identifier(self):
         self.assertEqual(w.search_query_for_code('IBW-495Z'),'IBW-495')
         self.assertEqual(w.search_query_for_code('AOZ-219Z'),'AOZ-219')
@@ -144,8 +156,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(first['rows'][0]['status'],'blocked')
         w.transfer(backend,self.out,'123',clock=clock.time,sleep=clock.sleep)
         self.assertEqual(len(backend.submitted),1)
-    def test_100_codes_one_batch_then_only_failed_codes_in_retry_batch(self):
-        codes=['TEST-'+str(i).zfill(3) for i in range(100)]
+    def test_116_codes_split_at_115_then_only_failed_codes_in_retry_batch(self):
+        codes=['TEST-'+str(i).zfill(3) for i in range(116)]
         rows=[]
         for i,code in enumerate(codes):
             cs=w.rank_candidates([
@@ -179,9 +191,9 @@ class WorkflowTests(unittest.TestCase):
                 raise AssertionError(name)
         backend=BatchBackend();clock=Clock()
         report=w.transfer(backend,self.out,'123',clock=clock.time,sleep=clock.sleep)
-        self.assertEqual([len(b) for b in backend.batches],[100,2])
+        self.assertEqual([len(b) for b in backend.batches],[115,1,2])
         first_write=backend.events.index('offline_download')
-        self.assertEqual(backend.events[:first_write].count('bt4g_resolve_candidate'),100)
+        self.assertEqual(backend.events[:first_write].count('bt4g_resolve_candidate'),116)
         self.assertTrue(all(r['status']=='completed' for r in report['rows']))
         self.assertEqual((self.out/'failed_codes.txt').read_text().strip(),'')
 

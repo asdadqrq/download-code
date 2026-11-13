@@ -30,7 +30,7 @@ from bs4 import BeautifulSoup
 
 KEYWORD = 'LTX'
 MIN_BYTES = 1024 ** 3
-FIELDS = ['title', 'magnet', 'create_time', 'file_size', 'file_size_bytes', 'info_hash', 'source', 'source_url']
+FIELDS = ['code', 'title', 'magnet', 'create_time', 'file_size', 'file_size_bytes', 'info_hash', 'source', 'source_url']
 PRINT_LOCK = threading.Lock()
 
 
@@ -126,7 +126,7 @@ class DateWindow:
 
 
 class CsvStore:
-    """One thread-safe hash check and durable append for every discovered item."""
+    """One thread-safe hash check and atomic top-of-file insert per new item."""
     def __init__(self, path, bounds=None, incremental=True):
         self.path, self.bounds = Path(path), bounds
         self.incremental = incremental
@@ -134,7 +134,9 @@ class CsvStore:
         self.lock = threading.Lock()
         self.counts = Counter()
         fields, rows = read_csv(self.path)
-        self.fields = fields + [f for f in FIELDS if f not in fields]
+        self.fields = ['code'] + [f for f in fields if f != 'code'] + [
+            f for f in FIELDS if f != 'code' and f not in fields
+        ]
         self.seen = set()
         self.urls = set()
         for row in rows:
@@ -159,13 +161,18 @@ class CsvStore:
                     self.latest[source] = max(created, self.latest.get(source, created))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if fields != self.fields or not self.path.exists():
-            temporary = self.path.with_suffix(self.path.suffix + '.tmp')
-            with temporary.open('w', encoding='utf-8-sig', newline='') as handle:
-                writer = csv.DictWriter(handle, fieldnames=self.fields)
-                writer.writeheader()
-                writer.writerows(rows)
-            temporary.replace(self.path)
+            self._write_rows(rows)
         log(f'CSV: {self.path.resolve()} | existing unique hashes: {len(self.seen)}')
+
+    def _write_rows(self, rows, fields=None):
+        temporary = self.path.with_suffix(self.path.suffix + '.tmp')
+        with temporary.open('w', encoding='utf-8-sig', newline='') as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields or self.fields, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(rows)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(self.path)
 
     def cutoff(self, source):
         # An explicit historical range overrides automatic incremental mode.
@@ -182,12 +189,7 @@ class CsvStore:
                 except ValueError:
                     return date.min
             rows.sort(key=date_key, reverse=True)
-            temporary = self.path.with_suffix(self.path.suffix + '.tmp')
-            with temporary.open('w', encoding='utf-8-sig', newline='') as handle:
-                writer = csv.DictWriter(handle, fieldnames=fields)
-                writer.writeheader()
-                writer.writerows(rows)
-            temporary.replace(self.path)
+            self._write_rows(rows, fields)
 
     def known_url(self, url):
         with self.lock:
@@ -208,13 +210,11 @@ class CsvStore:
             if not in_range(item.get('create_time'), self.bounds):
                 self.counts['outside_date_range'] += 1
                 return False
-            item = {**item, 'info_hash':digest}
+            item = {**item, 'info_hash':digest, 'code':''}
             if not item.get('magnet', '').lower().startswith('magnet:'):
                 item['magnet'] = 'magnet:?xt=urn:btih:' + digest
-            with self.path.open('a', encoding='utf-8', newline='') as handle:
-                csv.DictWriter(handle, fieldnames=self.fields, extrasaction='ignore').writerow(item)
-                handle.flush()
-                os.fsync(handle.fileno())
+            _, existing_rows = read_csv(self.path)
+            self._write_rows([item] + existing_rows)
             self.seen.add(digest)
             if item.get('source_url'):
                 self.urls.add(item['source_url'])
@@ -444,7 +444,7 @@ def collect_bt4g(store, args):
             if page['items'] and not new_on_page:
                 raise RuntimeError('BT4G pagination repeated the same results')
             pages += 1
-            log(f'bt4g: page {pages}, {len(page["items"])} items read, {store.counts["added"]} total appended')
+            log(f'bt4g: page {pages}, {len(page["items"])} items read, {store.counts["added"]} total added')
             if crossed:
                 log(f'bt4g: reached dates older than {window.cutoff}; incremental search complete')
                 break
@@ -463,7 +463,7 @@ def collect_bt4g(store, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--csv', '-o', '--output', dest='csv_path', type=Path, default=Path('LTX_results.csv'),
-                        help='Existing CSV to compare/append, or filename for a new CSV')
+                        help='Existing CSV to compare/prepend, or filename for a new CSV')
     parser.add_argument('--create-time', help='Inclusive range (YYYY-MM-DD,YYYY-MM-DD), overriding CSV date watermarks; null means no explicit date filter')
     parser.add_argument('--sources', nargs='+', choices=['bt4g','sukebei'], default=['bt4g','sukebei'])
     parser.add_argument('--delay', type=float, default=0.5)

@@ -1,4 +1,5 @@
 import unittest
+import json
 from unittest.mock import Mock, patch
 
 import check_bt4g_exists as checker
@@ -73,6 +74,38 @@ class VerifiedTabTests(unittest.TestCase):
     def test_wrong_site_rejected(self, run):
         with self.assertRaisesRegex(RuntimeError, "Select the verified"):
             checker.CurrentChromeClient()
+
+    @patch.object(checker, "run_applescript")
+    def test_navigation_keeps_pinned_tab_and_avoids_foreground_url_setter(self, run):
+        run.side_effect = [
+            "12\n34\nhttps://bt4gprx.com/",
+            '"navigation_scheduled"', '"navigation_scheduled"',
+            '"navigation_scheduled"', '"navigation_scheduled"',
+        ]
+        client = checker.CurrentChromeClient()
+        urls = [checker.BASE_URL + '/search?q=AAA-001',
+                checker.BASE_URL + '/search?q=AAA-001&p=2',
+                checker.BASE_URL + '/magnet/example',
+                checker.BASE_URL + '/magnet/example']  # Same-URL retry.
+        for url in urls:
+            client.call('Page.navigate', {'url': url})
+            lines = run.call_args.args[0]
+            self.assertIn('set targetTab to tab id 34 of window id 12', lines)
+            command = lines[2]
+            expression = json.loads(command.removeprefix('return execute targetTab javascript '))
+            self.assertIn('window.setTimeout(', expression)
+            self.assertIn('window.location.assign(' + json.dumps(url) + ')', expression)
+            self.assertNotIn('set URL', '\n'.join(lines))
+            self.assertNotIn('activate', '\n'.join(lines))
+
+    @patch.object(checker, "run_applescript")
+    def test_unacknowledged_navigation_fails_without_focus_changing_fallback(self, run):
+        run.side_effect = ["12\n34\nhttps://bt4gprx.com/", 'null']
+        client = checker.CurrentChromeClient()
+        with self.assertRaisesRegex(RuntimeError, 'acknowledge background navigation'):
+            client.call('Page.navigate', {'url': checker.BASE_URL})
+        self.assertEqual(run.call_count, 2)
+        self.assertNotIn('set URL', '\n'.join(run.call_args.args[0]))
 
 
 if __name__ == "__main__":

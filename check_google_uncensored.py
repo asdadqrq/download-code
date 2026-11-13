@@ -356,6 +356,16 @@ class ExistingChromeGoogleSearcher:
         self.retries = retries
         self.app = app
         self.tab = tab
+        if app is not None:
+            self.configure_background_app(app)
+
+    @staticmethod
+    def configure_background_app(app):
+        # These options belong to this ScriptingBridge connection, not Chrome's
+        # preferences. Keep replies, but forbid Apple events from requesting
+        # user interaction or switching the foreground application.
+        app.setSendMode_(0x00000003 | 0x00000010)  # kAEWaitReply | kAENeverInteract
+        app.setLaunchFlags_(int(app.launchFlags()) | 0x00000200)  # kLSLaunchDontSwitch
 
     @staticmethod
     def select_tabs(queries, count):
@@ -372,14 +382,13 @@ class ExistingChromeGoogleSearcher:
         objc.loadBundle("ScriptingBridge", bundle, bundle_path=framework)
         script_app = bundle["SBApplication"]
         candidates = []
-        chrome_windows = []
         for process in NSWorkspace.sharedWorkspace().runningApplications():
             if process.bundleIdentifier() != "com.google.Chrome":
                 continue
             app = script_app.applicationWithProcessIdentifier_(process.processIdentifier())
+            ExistingChromeGoogleSearcher.configure_background_app(app)
             try:
                 for window in app.windows():
-                    chrome_windows.append((len(window.tabs()), app, window))
                     active_id = window.activeTab().id()
                     for tab in window.tabs():
                         parsed = urlparse(tab.URL() or "")
@@ -402,22 +411,10 @@ class ExistingChromeGoogleSearcher:
             except (AttributeError, RuntimeError):
                 continue
         candidates.sort(key=lambda candidate: candidate[0])
-        if len(candidates) < count and (candidates or chrome_windows):
-            if candidates:
-                _, app, window, _ = candidates[0]
-            else:
-                _, app, window = max(chrome_windows, key=lambda item: item[0])
-            while len(candidates) < count:
-                new_tab = app.classForScriptingClass_("tab").alloc().initWithProperties_(
-                    {"URL": "https://www.google.com/"}
-                )
-                window.tabs().addObject_(new_tab)
-                added_tab = window.tabs()[-1]
-                candidates.append((5, app, window, added_tab))
         if len(candidates) < count:
             raise GoogleTabRequiredError(
-                "Open Chrome, then rerun. The script will reuse one Google "
-                "tab or create one in that Chrome profile."
+                "Open a Google homepage or search tab in Chrome, then rerun. "
+                "Background mode reuses that tab without creating or selecting tabs."
             )
         return [(app, tab) for _, app, _, tab in candidates[:count]]
 
@@ -441,6 +438,20 @@ class ExistingChromeGoogleSearcher:
             )
         return json.loads(result)
 
+    def navigate(self, url):
+        # Chrome's Apple-event URL setter can show its window. Navigate inside
+        # the existing page instead; return before unloading the document.
+        script = """(() => {
+          window.setTimeout(() => window.location.assign(%URL%), 0);
+          return 'navigation_scheduled';
+        })()""".replace('%URL%', json.dumps(url))
+        result = self.tab.executeJavascript_(script)
+        if result != 'navigation_scheduled':
+            raise RuntimeError(
+                "Chrome could not schedule background navigation. Check that "
+                "Allow JavaScript from Apple Events is enabled and the Google tab is open."
+            )
+
     def search(self, query, limit=10):
         url = GOOGLE_BROWSER_URL.format(query=quote_plus(query), num=limit)
         if self.tab is None:
@@ -448,7 +459,7 @@ class ExistingChromeGoogleSearcher:
         current_url = urlparse(self.tab.URL() or "")
         if (current_url.path != "/search"
                 or parse_qs(current_url.query).get("q", [None])[0] != query):
-            self.tab.setURL_(url)
+            self.navigate(url)
         script = google_result_script(query, limit)
         state = {}
         last_read_error = ''
@@ -476,7 +487,7 @@ class ExistingChromeGoogleSearcher:
             if attempt < self.retries:
                 print(f'Google did not finish loading {query}; retrying in the same tab...', flush=True)
                 time.sleep(2)
-                self.tab.setURL_(url)
+                self.navigate(url)
         details = '; '.join(filter(None, [
             f"URL={state.get('url', self.tab.URL() or 'unknown')}",
             f"title={state.get('title', 'unknown')}",
@@ -502,39 +513,42 @@ class SafariGoogleSearcher:
         return False
 
     def search(self, query, limit=10):
-        script = """
-on run argv
-    set searchUrl to item 1 of argv
-    set waitSeconds to item 2 of argv as integer
-    tell application "Safari"
-        activate
-        open location searchUrl
-        delay waitSeconds
-        set jsonText to do JavaScript "
+        # Pass JavaScript as data so its regex backslashes and quotes are not
+        # parsed a second time as AppleScript string literals.
+        javascript = r"""
 (() => {
   const limit = %LIMIT%;
   const rows = [];
   const seen = new Set();
   for (const a of Array.from(document.querySelectorAll('a'))) {
-    const title = (a.innerText || a.textContent || '').replace(/\\s+/g, ' ').trim();
+    const title = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
     const link = a.href || '';
     if (!title || !link || seen.has(link)) continue;
     seen.add(link);
     const block = a.closest('div');
-    const snippet = block ? (block.innerText || '').replace(/\\s+/g, ' ').trim() : '';
+    const snippet = block ? (block.innerText || '').replace(/\s+/g, ' ').trim() : '';
     rows.push({ title, snippet, link });
   }
   return JSON.stringify(rows.slice(0, limit * 8));
 })()
-" in front document
+""".replace("%LIMIT%", str(int(limit)))
+        script = """
+on run argv
+    set searchUrl to item 1 of argv
+    set waitSeconds to item 2 of argv as integer
+    set javascriptSource to item 3 of argv
+    tell application "Safari"
+        activate
+        open location searchUrl
+        delay waitSeconds
+        set jsonText to do JavaScript javascriptSource in front document
     end tell
     return jsonText
 end run
 """
         url = GOOGLE_SEARCH_URL.format(query=quote_plus(query), num=limit)
-        script = script.replace("%LIMIT%", str(int(limit)))
         result = subprocess.run(
-            ["osascript", "-", url, str(max(0, int(self.wait_seconds)))],
+            ["osascript", "-", url, str(max(0, int(self.wait_seconds))), javascript],
             input=script,
             text=True,
             capture_output=True,
@@ -542,10 +556,12 @@ end run
         )
         if result.returncode != 0:
             message = (result.stderr or result.stdout or "").strip()
+            hint = ""
+            if "allow javascript from apple events" in message.casefold():
+                hint = "Enable Safari > Develop > Allow JavaScript from Apple Events. "
             raise RuntimeError(
                 "Safari could not return Google results. "
-                "Enable Safari > Develop > Allow JavaScript from Apple Events. "
-                f"Details: {message}"
+                f"{hint}Details: {message}"
             )
         raw_results = json.loads(result.stdout.strip() or "[]")
         results = []
@@ -903,13 +919,40 @@ def check_codes_parallel(codes, searchers, limit=4, delay=4.0,
     return rows
 
 
+def write_results_csv(path, rows, fieldnames):
+    """Replace the CSV only after its complete replacement has been written."""
+    path = Path(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", newline="", encoding="utf-8-sig", dir=path.parent,
+            prefix=path.name + ".", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Search Google for "<code> uncensored" and mark whether results contain the code.'
     )
     parser.add_argument("codes", nargs="*", help="Codes. Comma-separated input is accepted.")
     parser.add_argument("--codes-file", help="Text file containing codes, one per line or comma-separated")
-    parser.add_argument("-o", "--output", default="google_uncensored_check.csv", help="Output CSV path")
+    parser.add_argument("-o", "--output", help="Output CSV path (default: google_uncensored_check.csv, or the retry input CSV)")
+    parser.add_argument(
+        "--retry-errors", nargs="?", const="", metavar="CSV",
+        help="Retry matched=error rows from CSV (default: --output or google_uncensored_check.csv), preserving other rows",
+    )
+    parser.add_argument(
+        "--retry-unknown", action="store_true",
+        help="Also retry matched=unknown rows; requires --retry-errors",
+    )
     parser.add_argument("--limit", type=int, default=4, help="Google results to check per code")
     parser.add_argument("--delay", type=float, default=4.0, help="Seconds to wait between searches")
     parser.add_argument("--workers", type=int, choices=[1], default=1,
@@ -932,11 +975,47 @@ def main():
     if args.browser_timeout <= 0 or args.browser_retries < 0:
         parser.error("--browser-timeout must be positive and --browser-retries must be non-negative")
 
-    codes = split_codes(args.codes)
-    if args.codes_file:
-        codes.extend(split_codes(Path(args.codes_file).read_text(encoding="utf-8").splitlines()))
-    if not codes:
-        parser.error("provide at least one code")
+    original_rows = None
+    original_fields = None
+    retry_indices = []
+    retry_source = None
+    if args.retry_unknown and args.retry_errors is None:
+        parser.error("--retry-unknown requires --retry-errors")
+    if args.retry_errors is not None:
+        if args.codes or args.codes_file:
+            parser.error("use --retry-errors without positional codes or --codes-file")
+        retry_source = Path(args.retry_errors or args.output or "google_uncensored_check.csv")
+        try:
+            with retry_source.open(encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                original_fields = reader.fieldnames or []
+                if not {"code", "matched"}.issubset(original_fields):
+                    parser.error("retry CSV must contain code and matched columns")
+                original_rows = list(reader)
+        except (OSError, UnicodeError, csv.Error) as exc:
+            parser.error(f"cannot read retry CSV: {exc}")
+        statuses = {"error", "unknown"} if args.retry_unknown else {"error"}
+        retry_indices = [i for i, row in enumerate(original_rows)
+                         if (row.get("matched") or "").strip().lower() in statuses]
+        codes = []
+        for i in retry_indices:
+            code = (original_rows[i].get("code") or "").strip().upper()
+            if not code:
+                parser.error(f"retry CSV row {i + 2} has no code")
+            if code not in codes:
+                codes.append(code)
+        args.output = args.output or str(retry_source)
+        if not codes:
+            print(f"No eligible error rows in {retry_source}; nothing to retry.")
+            return
+        print(f"Retrying {len(codes)} code(s) from {retry_source}")
+    else:
+        args.output = args.output or "google_uncensored_check.csv"
+        codes = split_codes(args.codes)
+        if args.codes_file:
+            codes.extend(split_codes(Path(args.codes_file).read_text(encoding="utf-8").splitlines()))
+        if not codes:
+            parser.error("provide at least one code or use --retry-errors")
 
     if args.browser == "none":
         rows = check_codes(codes, limit=args.limit, delay=args.delay)
@@ -975,10 +1054,20 @@ def main():
             print("Trying Safari browser search...")
             with SafariGoogleSearcher(wait_seconds=args.browser_wait) as searcher:
                 rows = check_codes(codes, limit=args.limit, delay=args.delay, browser_searcher=searcher)
-    with open(args.output, "w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+    fieldnames = list(rows[0].keys())
+    if original_rows is not None:
+        retry_results = {row["code"].strip().upper(): row for row in rows}
+        for i in retry_indices:
+            code = original_rows[i]["code"].strip().upper()
+            if code in retry_results:
+                original_rows[i] = {**original_rows[i], **retry_results[code]}
+        fieldnames = list(dict.fromkeys(original_fields + fieldnames))
+        rows = original_rows
+        if Path(args.output).resolve() == retry_source.resolve():
+            backup = retry_source.with_name(retry_source.name + f".{time.time_ns()}.bak")
+            shutil.copy2(retry_source, backup)
+            print(f"Saved original CSV to {backup}")
+    write_results_csv(args.output, rows, fieldnames)
     print(f"Wrote {len(rows)} rows to {args.output}")
 
 

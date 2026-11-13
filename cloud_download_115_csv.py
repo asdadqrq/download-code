@@ -12,6 +12,12 @@ import time
 from urllib.parse import parse_qs, urlsplit
 from check_115_exists_mcp import NetdiskMCP, load_server_config
 
+REPORT_FIELDS = [
+    'csv_row', 'code', 'folder_id', 'status', 'submission', 'magnet', 'info_hash',
+    'task_status', 'percent_done', 'task_folder_id', 'file_id',
+    'destination_matches', 'error', 'submission_output',
+]
+
 
 def normalize_magnet(value):
     value = (value or '').strip()
@@ -81,9 +87,57 @@ def task_status(task, folder_id):
     return {-1:'failed',1:'downloading',2:'completed'}.get(task['status'],'queued_or_unknown')
 
 
+def load_report(path):
+    """Read CSV receipts, or import a legacy JSON report without rewriting it."""
+    if path.suffix.lower() == '.json':
+        return json.loads(path.read_text(encoding='utf-8'))
+    with path.open(encoding='utf-8-sig', newline='') as handle:
+        reader = csv.DictReader(handle)
+        if not {'folder_id', 'code', 'info_hash', 'submission'}.issubset(reader.fieldnames or []):
+            raise ValueError('Invalid CSV report; missing submission receipt columns')
+        records = list(reader)
+    folders = {r['folder_id'] for r in records}
+    if len(folders) != 1:
+        raise ValueError('CSV report must contain exactly one destination folder')
+    rows = []
+    for record in records:
+        row = {key:record.get(key, '') for key in (
+            'code', 'status', 'submission', 'magnet', 'info_hash', 'error', 'submission_output',
+        )}
+        if record.get('task_status', '') != '':
+            row['task'] = {
+                'info_hash':row['info_hash'], 'status':int(record['task_status']),
+                'percent_done':float(record.get('percent_done') or 0),
+                'folder_id':record.get('task_folder_id', ''),
+                'file_id':record.get('file_id', ''),
+            }
+        if record.get('destination_matches', '') != '':
+            row['destination_matches'] = record['destination_matches'].lower() == 'true'
+        rows.append(row)
+    return {'folder_id':next(iter(folders)), 'rows':rows}
+
+
 def save_report(path, folder_id, rows):
+    if path.suffix.lower() != '.csv':
+        raise ValueError('Report output must use a .csv filename')
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({'folder_id':folder_id, 'rows':rows}, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    temporary = path.with_suffix('.csv.tmp')
+    with temporary.open('w', encoding='utf-8-sig', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=REPORT_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            task = row.get('task') or {}
+            writer.writerow({
+                **{key:row.get(key, '') for key in (
+                    'csv_row', 'code', 'status', 'submission', 'magnet', 'info_hash',
+                    'destination_matches', 'error', 'submission_output',
+                )},
+                'folder_id':folder_id, 'task_status':task.get('status', ''),
+                'percent_done':task.get('percent_done', ''),
+                'task_folder_id':task.get('folder_id', ''),
+                'file_id':task.get('file_id', ''),
+            })
+    temporary.replace(path)
     codes = list(dict.fromkeys(
         [row['code'] for row in rows if row.get('status') == 'downloading']
         + [row['code'] for row in rows if row.get('status') in ('failed','invalid_input')]
@@ -100,26 +154,29 @@ def main():
     parser.add_argument('--config', type=Path, default=Path.home()/'.codex/config.toml')
     parser.add_argument('--wait', type=float, default=30)
     parser.add_argument('--batch-size', type=int, default=10)
-    parser.add_argument('--report', type=Path, default=Path('115_cloud_download_report.json'))
+    parser.add_argument('--report', type=Path, default=Path('115_cloud_download_report.csv'))
     parser.add_argument('--check-only', action='store_true', help='Read statuses without submitting downloads')
     parser.add_argument('--limit', type=int, help='Optional number of CSV rows to process')
     parser.add_argument('--skip-check', action='store_true', help='Submit and save receipts without waiting/checking')
     args = parser.parse_args()
     if not args.folder_id.isdigit() or args.wait < 0 or not 1 <= args.batch_size <= 20 or (args.limit is not None and args.limit < 1):
         parser.error('Invalid folder ID, wait, batch size, or limit')
+    if args.report.suffix.lower() != '.csv':
+        parser.error('--report must end in .csv')
     rows = read_input(args.csv)
     if args.limit:
         rows = rows[:args.limit]
     # Reuse receipts after interruption. Never resubmit an ambiguous/accepted call.
-    if args.report.exists():
-        previous = json.loads(args.report.read_text(encoding='utf-8'))
+    previous_path = args.report if args.report.exists() else args.report.with_suffix('.json')
+    if previous_path.exists():
+        previous = load_report(previous_path)
         if previous.get('folder_id') != args.folder_id:
             raise SystemExit('Existing report targets another folder; choose a different --report')
         receipts = {r.get('info_hash'):r for r in previous['rows'] if r.get('info_hash')}
         for row in rows:
             old = receipts.get(row.get('info_hash'))
             if old:
-                for key in ('submission','submission_output','status'):
+                for key in ('submission','submission_output','status','task','destination_matches'):
                     if key in old: row[key] = old[key]
     unique = {}
     for row in rows:
@@ -173,7 +230,8 @@ def main():
                 row['task'] = task
                 row['destination_matches'] = task['folder_id'] == args.folder_id
         save_report(args.report, args.folder_id, rows)
-        print('RESULTS ' + json.dumps(dict(Counter(r.get('status','unconfirmed') for r in rows))), flush=True)
+        counts = Counter(r.get('status','unconfirmed') for r in rows)
+        print('RESULTS ' + ', '.join(f'{status}={count}' for status, count in counts.items()), flush=True)
         print('FAILED CODES: ' + ','.join(dict.fromkeys(r['code'] for r in rows if r.get('status') in ('failed','invalid_input'))), flush=True)
         print('DOWNLOADING CODES: ' + ','.join(dict.fromkeys(r['code'] for r in rows if r.get('status') == 'downloading')), flush=True)
         print('Report: ' + str(args.report.resolve()), flush=True)
